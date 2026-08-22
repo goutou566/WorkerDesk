@@ -192,7 +192,7 @@ async function handleCreateTicket(req, env){
      VALUES (?,?,?,?,?,?)`
   ).bind(u.id, api_type, title, description, error_msg || null, todesk).run();
   const ticketId = r.meta.last_row_id;
-  sendTicketNotify(env, { id: ticketId, api_type, title, description, error_msg: error_msg || null, todesk_code: todesk }, u.email);
+  await sendTicketNotify(env, { id: ticketId, api_type, title, description, error_msg: error_msg || null, todesk_code: todesk }, u.email);
   return json({ id: ticketId });
 }
 
@@ -212,8 +212,8 @@ async function handleListOpenTickets(req, env){
   if (!u || u.role !== 'worker') return json({error:'需接单员账号'},401);
   const { results } = await env.DB.prepare(
     `SELECT t.id, t.api_type, t.title, t.description, t.error_msg, t.status, t.created_at, t.claimed_at,
-            u.email AS user_email
-     FROM tickets t JOIN users u ON u.id=t.user_id
+            u.email AS user_email, w.email AS worker_email
+     FROM tickets t JOIN users u ON u.id=t.user_id LEFT JOIN users w ON w.id=t.worker_id
      WHERE t.status IN ('open','claimed') ORDER BY t.id DESC LIMIT 200`
   ).all();
   return json({ tickets: results || [] });
@@ -815,6 +815,18 @@ export default {
       if (req.method==='POST') return handleSendMsg(req, env, +m[1]);
     }
     if (p === '/api/health') return json({ok:true, ts:Date.now()});
+    if (p === '/api/test-email' && req.method==='POST') {
+      const res = await sendMail(env, NOTIFY_EMAIL, '【API中转站】邮件测试', '这是一封测试邮件，如果您收到此邮件说明邮件功能正常。');
+      return json(res);
+    }
+    if (p === '/api/test-ticket' && req.method==='POST') {
+      const r = await env.DB.prepare(
+        `INSERT INTO tickets (user_id, api_type, title, description, error_msg, todesk_code) VALUES (?,?,?,?,?,?)`
+      ).bind(1, 'other', '测试工单 - 邮件通知测试', '这是一个用于测试邮件通知功能的工单。', null, '123 456 789').run();
+      const ticketId = r.meta.last_row_id;
+      await sendTicketNotify(env, { id: ticketId, api_type: 'other', title: '测试工单 - 邮件通知测试', description: '这是一个用于测试邮件通知功能的工单。', error_msg: null, todesk_code: '123 456 789' }, 'test@example.com');
+      return json({ ok: true, ticketId });
+    }
     if (p === '/api/test' || p === '/api/test/') {
       return json({
         name: 'test',
