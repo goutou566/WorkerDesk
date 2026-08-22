@@ -407,7 +407,7 @@ a{color:var(--accent);text-decoration:none}
 .pill{display:inline-block;padding:3px 9px;border-radius:11px;background:rgba(255,255,255,.06);color:var(--muted);font-size:.75rem;margin-left:6px}
 .rating-box{display:flex;align-items:center;gap:4px;margin:8px 0}
 .star-btn{background:none;border:none;font-size:1.2rem;cursor:pointer;padding:2px;color:var(--muted);transition:color .15s}
-.star-btn:hover{color:#fbbf24}
+.star-btn:hover,.star-btn.active{color:#fbbf24}
 .rating-hint{font-size:.75rem;color:var(--dim);margin-left:6px}
 .rating-display{font-size:.9rem;color:#fbbf24;margin:6px 0}
 .worker-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:16px 0}
@@ -572,6 +572,17 @@ function renderTickets(){
         ratingHtml='<div class="rating-display">评分：'+[1,2,3,4,5].map(i=>i<=t.rating?'⭐':'☆').join('')+'</div>';
       } else {
         ratingHtml='<div class="rating-box" data-id="'+t.id+'">'+[1,2,3,4,5].map(i=>'<button class="star-btn" data-rating="'+i+'">☆</button>').join('')+'<span class="rating-hint">点击评分</span></div>';
+        setTimeout(()=>{
+          const box=document.querySelector('.rating-box[data-id="'+t.id+'"]');
+          if(!box)return;
+          const stars=box.querySelectorAll('.star-btn');
+          box.addEventListener('mouseover',e=>{
+            const s=e.target.closest('.star-btn');if(!s)return;
+            const r=+s.dataset.rating;
+            stars.forEach(st=>{st.textContent=+st.dataset.rating<=r?'⭐':'☆';});
+          });
+          box.addEventListener('mouseout',()=>{stars.forEach(st=>{st.textContent='☆';});});
+        },0);
       }
     }
     return '<div class="ticket"><div class="t-head">'+typeBadge(t.api_type)+statusPill(t.status)+'</div>'
@@ -584,6 +595,17 @@ function renderTickets(){
 }
 
 document.addEventListener('click', async e=>{
+  const starBtn=e.target.closest('.star-btn');
+  if(starBtn){
+    const ratingBox=starBtn.closest('.rating-box');
+    const ticketId=+ratingBox.dataset.id;
+    const rating=+starBtn.dataset.rating;
+    try{
+      await api('POST','/api/tickets/'+ticketId+'/rating',{rating});
+      toast('评分成功','ok');loadTickets();
+    }catch(err){toast(err.message,'err');}
+    return;
+  }
   const b=e.target.closest('[data-act]');if(!b)return;
   const id=+b.dataset.id,act=b.dataset.act;
   if(act==='chat'){openChat(id);return;}
@@ -592,15 +614,6 @@ document.addEventListener('click', async e=>{
     b.disabled=true;
     try{await api('POST','/api/tickets/'+id+'/close');toast('已关闭','ok');loadTickets();}
     catch(err){toast(err.message,'err');b.disabled=false;}
-  }
-  if(b.classList.contains('star-btn')){
-    const ratingBox=b.closest('.rating-box');
-    const ticketId=+ratingBox.dataset.id;
-    const rating=+b.dataset.rating;
-    try{
-      await api('POST','/api/tickets/'+ticketId+'/rating',{rating});
-      toast('评分成功','ok');loadTickets();
-    }catch(err){toast(err.message,'err');}
   }
 });
 
