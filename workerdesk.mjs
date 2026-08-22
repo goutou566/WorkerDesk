@@ -256,8 +256,34 @@ async function handleTicketDetail(req, env, id){
   ).bind(id).first();
   if (!t) return json({error:'工单不存在'},404);
   if (t.user_id !== u.id && t.worker_id !== u.id) return json({error:'无权限'},403);
-  // Only user or worker can see todesk code; strip from other responses already
   return json({ ticket: t });
+}
+
+async function handleRateTicket(req, env, id){
+  const u = await session(req, env);
+  if (!u) return json({error:'未登录'},401);
+  const t = await env.DB.prepare('SELECT * FROM tickets WHERE id=?').bind(id).first();
+  if (!t) return json({error:'工单不存在'},404);
+  if (t.user_id !== u.id) return json({error:'仅发单方可评分'},403);
+  if (t.status !== 'completed') return json({error:'仅已完成工单可评分'},400);
+  if (t.rating !== null) return json({error:'已评分'},400);
+  const b = await req.json().catch(()=>({}));
+  const rating = parseInt(b.rating);
+  if (!rating || rating < 1 || rating > 5) return json({error:'评分 1-5'},400);
+  await env.DB.prepare('UPDATE tickets SET rating=? WHERE id=?').bind(rating, id).run();
+  return json({ok:true});
+}
+
+async function handleWorkerStats(req, env){
+  const u = await session(req, env);
+  if (!u || u.role !== 'worker') return json({error:'需接单员账号'},401);
+  const { results } = await env.DB.prepare(
+    `SELECT COUNT(*) as total, COUNT(CASE WHEN status='completed' THEN 1 END) as completed,
+            COUNT(CASE WHEN rating IS NOT NULL THEN 1 END) as rated,
+            COALESCE(AVG(CASE WHEN rating IS NOT NULL THEN rating END), 0) as avg_rating
+     FROM tickets WHERE worker_id=?`
+  ).bind(u.id).all();
+  return json({ stats: results[0] || { total:0, completed:0, rated:0, avg_rating:0 } });
 }
 
 // =============== messages ===============
@@ -379,6 +405,15 @@ a{color:var(--accent);text-decoration:none}
 .spin{display:inline-block;width:15px;height:15px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:sp .7s linear}
 @keyframes sp{to{transform:rotate(360deg)}}
 .pill{display:inline-block;padding:3px 9px;border-radius:11px;background:rgba(255,255,255,.06);color:var(--muted);font-size:.75rem;margin-left:6px}
+.rating-box{display:flex;align-items:center;gap:4px;margin:8px 0}
+.star-btn{background:none;border:none;font-size:1.2rem;cursor:pointer;padding:2px;color:var(--muted);transition:color .15s}
+.star-btn:hover{color:#fbbf24}
+.rating-hint{font-size:.75rem;color:var(--dim);margin-left:6px}
+.rating-display{font-size:.9rem;color:#fbbf24;margin:6px 0}
+.worker-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:16px 0}
+.stat-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius-sm);padding:14px;text-align:center}
+.stat-value{font-size:1.5rem;font-weight:700;color:var(--accent)}
+.stat-label{font-size:.78rem;color:var(--muted);margin-top:4px}
 `;
 }
 
@@ -531,10 +566,19 @@ function renderTickets(){
         + (t.status==='claimed'?'<button class="btn btn-ghost" data-act="close" data-id="'+t.id+'">关闭</button>':'');
     }
     const worker = t.worker_email ? '<span class="meta-item">🔧 '+esc(t.worker_email)+'</span>' : '';
+    let ratingHtml='';
+    if(t.status==='completed'){
+      if(t.rating!==null){
+        ratingHtml='<div class="rating-display">评分：'+[1,2,3,4,5].map(i=>i<=t.rating?'⭐':'☆').join('')+'</div>';
+      } else {
+        ratingHtml='<div class="rating-box" data-id="'+t.id+'">'+[1,2,3,4,5].map(i=>'<button class="star-btn" data-rating="'+i+'">☆</button>').join('')+'<span class="rating-hint">点击评分</span></div>';
+      }
+    }
     return '<div class="ticket"><div class="t-head">'+typeBadge(t.api_type)+statusPill(t.status)+'</div>'
       +'<h3 class="t-title">'+esc(t.title)+'</h3>'
       +'<p class="t-desc">'+esc(t.description)+'</p>'
       +'<div class="t-meta"><span>🕒 '+fmtRel(t.created_at)+'</span>'+worker+'</div>'
+      +ratingHtml
       +'<div class="t-actions">'+actions+'</div></div>';
   }).join('');
 }
@@ -548,6 +592,15 @@ document.addEventListener('click', async e=>{
     b.disabled=true;
     try{await api('POST','/api/tickets/'+id+'/close');toast('已关闭','ok');loadTickets();}
     catch(err){toast(err.message,'err');b.disabled=false;}
+  }
+  if(b.classList.contains('star-btn')){
+    const ratingBox=b.closest('.rating-box');
+    const ticketId=+ratingBox.dataset.id;
+    const rating=+b.dataset.rating;
+    try{
+      await api('POST','/api/tickets/'+ticketId+'/rating',{rating});
+      toast('评分成功','ok');loadTickets();
+    }catch(err){toast(err.message,'err');}
   }
 });
 
@@ -638,6 +691,8 @@ function renderWorkerPage(user){
     <p>实时刷新，待接单 / 进行中工单</p>
   </div>
 
+  <div class="worker-stats" id="workerStats"></div>
+
   <div style="display:flex;align-items:center;gap:10px;margin:10px 0">
     <div class="tabs" style="margin:0;flex:1">
       <button class="tab active" data-view="open">待接单</button>
@@ -700,7 +755,19 @@ async function loadAll(){
   try{
     const d=await api('GET','/api/tickets/open');
     STATE.tickets=d.tickets||[];renderList();
+    loadStats();
   }catch(e){toast(e.message,'err');}
+}
+async function loadStats(){
+  try{
+    const d=await api('GET','/api/worker/stats');
+    const s=d.stats||{};
+    const box=$('#workerStats');if(!box)return;
+    box.innerHTML='<div class="stat-card"><div class="stat-value">'+(s.total||0)+'</div><div class="stat-label">总接单</div></div>'
+      +'<div class="stat-card"><div class="stat-value">'+(s.completed||0)+'</div><div class="stat-label">已完成</div></div>'
+      +'<div class="stat-card"><div class="stat-value">'+(s.rated||0)+'</div><div class="stat-label">已评分</div></div>'
+      +'<div class="stat-card"><div class="stat-value">'+(s.avg_rating?Number(s.avg_rating).toFixed(1):'-')+'</div><div class="stat-label">平均分</div></div>';
+  }catch(e){}
 }
 function renderList(){
   const box=$('#ticketList');if(!box)return;
@@ -814,6 +881,10 @@ export default {
       if (req.method==='GET') return handleGetMsgs(req, env, +m[1], url.searchParams.get('after'));
       if (req.method==='POST') return handleSendMsg(req, env, +m[1]);
     }
+    if (m = p.match(/^\/api\/tickets\/(\d+)\/rating$/)) {
+      if (req.method==='POST') return handleRateTicket(req, env, +m[1]);
+    }
+    if (p === '/api/worker/stats' && req.method==='GET') return handleWorkerStats(req, env);
     if (p === '/api/health') return json({ok:true, ts:Date.now()});
     if (p === '/api/test-email' && req.method==='POST') {
       const res = await sendMail(env, NOTIFY_EMAIL, '【API中转站】邮件测试', '这是一封测试邮件，如果您收到此邮件说明邮件功能正常。');
