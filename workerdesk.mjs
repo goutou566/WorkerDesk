@@ -8,8 +8,6 @@ Content-Disposition: form-data; name="worker.js"
 const ORIGIN = 'https://kf.goutou.dpdns.org';
 const SESSION_TTL = 60 * 60 * 24 * 30;
 const CODE_TTL = 600; // 10 min verification code
-const NOTIFY_EMAIL = 'qkiojjgjghhh@163.com';
-const MAIL_FROM = 'API中转站 <noreply@goutou.dpdns.org>';
 
 const API_TYPES = [
   { id: 'chatgpt',  name: 'ChatGPT / OpenAI',  icon: '🟢' },
@@ -59,16 +57,16 @@ function fmtRel(s){
 function validEmail(e){ return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e); }
 
 // =============== email (Resend) ===============
-async function sendMail(env, to, subject, text){
+async function sendCode(to, code, env){
   if (!env.RESEND_API_KEY) return { ok: false, error: 'RESEND_API_KEY not configured' };
   const r = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: { 'Authorization': 'Bearer ' + env.RESEND_API_KEY, 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      from: MAIL_FROM,
+      from: 'API中转站 <noreply@goutou.dpdns.org>',
       to: [to],
-      subject,
-      text
+      subject: '【API中转站】您的邮箱验证码',
+      text: `您的邮箱验证码是：${code}\n\n该验证码 10 分钟内有效，请勿告知他人。\n如非本人操作，请忽略此邮件。`
     })
   });
   if (!r.ok) {
@@ -76,28 +74,6 @@ async function sendMail(env, to, subject, text){
     return { ok: false, error: '邮件发送失败: '+r.status+' '+t };
   }
   return { ok: true };
-}
-
-async function sendCode(to, code, env){
-  return sendMail(env, to, '【API中转站】您的邮箱验证码',
-    `您的邮箱验证码是：${code}\n\n该验证码 10 分钟内有效，请勿告知他人。\n如非本人操作，请忽略此邮件。`);
-}
-
-async function sendTicketNotify(env, ticket, userEmail){
-  const type = API_TYPES.find(x=>x.id===ticket.api_type) || { name: ticket.api_type };
-  const res = await sendMail(env, NOTIFY_EMAIL,
-    `【API中转站】新工单 #${ticket.id}：${ticket.title}`,
-    `收到新工单，请及时处理。\n\n`+
-    `工单号：#${ticket.id}\n`+
-    `问题类型：${type.name}\n`+
-    `标题：${ticket.title}\n`+
-    `发单方：${userEmail}\n`+
-    `描述：\n${ticket.description}\n`+
-    (ticket.error_msg ? `\n报错信息：\n${ticket.error_msg}\n` : '')+
-    `\nToDesk 远控码：${ticket.todesk_code}\n\n`+
-    `处理入口：${ORIGIN}/jd`
-  );
-  if (!res.ok) console.log('NOTIFY_FAIL', ticket.id, res.error);
 }
 
 // =============== auth ===============
@@ -192,7 +168,6 @@ async function handleCreateTicket(req, env){
      VALUES (?,?,?,?,?,?)`
   ).bind(u.id, api_type, title, description, error_msg || null, todesk).run();
   const ticketId = r.meta.last_row_id;
-  await sendTicketNotify(env, { id: ticketId, api_type, title, description, error_msg: error_msg || null, todesk_code: todesk }, u.email);
   return json({ id: ticketId });
 }
 
@@ -428,6 +403,8 @@ async function api(m,p,b){const o={method:m,headers:{}};if(b){o.headers['Content
 function openModal(id){$('#'+id).classList.add('show');}
 function closeModal(id){$('#'+id).classList.remove('show');}
 window.closeModal=closeModal;
+function initNotify(){if('Notification' in window&&Notification.permission==='default')Notification.requestPermission();}
+function notify(title,body){if('Notification' in window&&Notification.permission==='granted')new Notification(title,{body,icon:'/favicon.ico'});}
 `;
 }
 
@@ -517,7 +494,8 @@ function renderUserPage(user){
 
 <script>
 ${commonJs()}
-const STATE = { user: ${user ? JSON.stringify({id:user.id,email:user.email,role:user.role}) : 'null'}, tickets: [], chatId:null, lastMsgId:0, pollTimer:null };
+const STATE = { user: ${user ? JSON.stringify({id:user.id,email:user.email,role:user.role}) : 'null'}, tickets: [], prevTickets: {}, chatId:null, lastMsgId:0, pollTimer:null };
+initNotify();
 
 $('#authForm')?.addEventListener('submit', async e=>{
   e.preventDefault();
@@ -551,7 +529,15 @@ function statusPill(s){const m=${JSON.stringify(TICKET_STATUS)};const x=m[s]||m.
 async function loadTickets(){
   try{
     const d=await api('GET','/api/tickets/mine');
-    STATE.tickets=d.tickets||[];renderTickets();
+    const newTickets=d.tickets||[];
+    newTickets.forEach(t=>{
+      const prev=STATE.prevTickets[t.id];
+      if(prev&&prev.status==='open'&&t.status==='claimed'){
+        notify('工单被接取','#'+t.id+' '+t.title+' 已被 '+t.worker_email+' 接取');
+      }
+    });
+    STATE.prevTickets={};newTickets.forEach(t=>{STATE.prevTickets[t.id]=t;});
+    STATE.tickets=newTickets;renderTickets();
   }catch(e){toast(e.message,'err');}
 }
 function renderTickets(){
@@ -625,7 +611,7 @@ function openChat(id){
   $('#chatBox').classList.add('show');
   $('#chatMsgs').innerHTML='';
   pollMsgs();
-  STATE.pollTimer=setInterval(pollMsgs,3000);
+  STATE.pollTimer=setInterval(pollMsgs,2000);
 }
 function closeChat(){
   STATE.chatId=null;if(STATE.pollTimer){clearInterval(STATE.pollTimer);STATE.pollTimer=null;}
@@ -642,6 +628,7 @@ async function pollMsgs(){
       const div=document.createElement('div');div.className='msg '+(me?'me':'them');
       div.innerHTML=esc(m.content)+'<span class="time">'+fmtRel(m.created_at)+'</span>';
       $('#chatMsgs').appendChild(div);
+      if(!me)notify('新消息','#'+STATE.chatId+': '+m.content.substring(0,50));
     });
     if(d.messages&&d.messages.length)$('#chatMsgs').scrollTop=$('#chatMsgs').scrollHeight;
   }catch(e){}
@@ -657,7 +644,7 @@ async function sendMsg(){
 
 $('#fabTop').onclick=()=>window.scrollTo({top:0,behavior:'smooth'});
 
-if(STATE.user)loadTickets();
+if(STATE.user){ loadTickets(); setInterval(loadTickets, 5000); }
 </script>
 </body></html>`;
 }
@@ -727,7 +714,8 @@ function renderWorkerPage(user){
 
 <script>
 ${commonJs()}
-const STATE={ user:${user?JSON.stringify({id:user.id,email:user.email,role:user.role}):'null'}, mode:'login', view:'open', tickets:[], chatId:null, lastMsgId:0, poll:null };
+const STATE={ user:${user?JSON.stringify({id:user.id,email:user.email,role:user.role}):'null'}, mode:'login', view:'open', tickets:[], prevTicketCount:0, chatId:null, lastMsgId:0, poll:null };
+initNotify();
 
 $$('.tab').forEach(t=>t.onclick=()=>{
   if(t.dataset.view!==undefined){ STATE.view=t.dataset.view; $$('.tab').forEach(x=>x.classList.toggle('active',x===t)); renderList(); return; }
@@ -767,7 +755,14 @@ function statusPill(s){const m=${JSON.stringify(TICKET_STATUS)};const x=m[s]||m.
 async function loadAll(){
   try{
     const d=await api('GET','/api/tickets/open');
-    STATE.tickets=d.tickets||[];renderList();
+    const newTickets=d.tickets||[];
+    const prevCount=STATE.prevTicketCount||0;
+    if(prevCount>0&&newTickets.length>prevCount){
+      const newCount=newTickets.length-prevCount;
+      notify('新工单','有 '+newCount+' 个新工单待接取');
+    }
+    STATE.prevTicketCount=newTickets.length;
+    STATE.tickets=newTickets;renderList();
     loadStats();
   }catch(e){toast(e.message,'err');}
 }
@@ -831,7 +826,7 @@ function openChat(id,title){
   STATE.chatId=id;STATE.lastMsgId=0;
   $('#chatTitle').textContent='# '+id+(title?' · '+title:'');
   $('#chatBox').classList.add('show');$('#chatMsgs').innerHTML='';
-  pollMsgs();STATE.poll=setInterval(pollMsgs,3000);
+  pollMsgs();STATE.poll=setInterval(pollMsgs,2000);
 }
 function closeChat(){STATE.chatId=null;if(STATE.poll){clearInterval(STATE.poll);STATE.poll=null;}$('#chatBox').classList.remove('show');}
 $('#chatBack').onclick=closeChat;
@@ -845,6 +840,7 @@ async function pollMsgs(){
       const div=document.createElement('div');div.className='msg '+(me?'me':'them');
       div.innerHTML=esc(m.content)+'<span class="time">'+fmtRel(m.created_at)+'</span>';
       $('#chatMsgs').appendChild(div);
+      if(!me)notify('新消息','#'+STATE.chatId+': '+m.content.substring(0,50));
     });
     if(d.messages&&d.messages.length)$('#chatMsgs').scrollTop=$('#chatMsgs').scrollHeight;
   }catch(e){}
@@ -857,7 +853,7 @@ async function sendMsg(){
   catch(e){toast(e.message,'err');inp.value=v;}
 }
 
-if(STATE.user){ loadAll(); setInterval(loadAll,15000); }
+if(STATE.user){ loadAll(); setInterval(loadAll, 5000); }
 </script>
 </body></html>`;
 }
@@ -899,18 +895,6 @@ export default {
     }
     if (p === '/api/worker/stats' && req.method==='GET') return handleWorkerStats(req, env);
     if (p === '/api/health') return json({ok:true, ts:Date.now()});
-    if (p === '/api/test-email' && req.method==='POST') {
-      const res = await sendMail(env, NOTIFY_EMAIL, '【API中转站】邮件测试', '这是一封测试邮件，如果您收到此邮件说明邮件功能正常。');
-      return json(res);
-    }
-    if (p === '/api/test-ticket' && req.method==='POST') {
-      const r = await env.DB.prepare(
-        `INSERT INTO tickets (user_id, api_type, title, description, error_msg, todesk_code) VALUES (?,?,?,?,?,?)`
-      ).bind(1, 'other', '测试工单 - 邮件通知测试', '这是一个用于测试邮件通知功能的工单。', null, '123 456 789').run();
-      const ticketId = r.meta.last_row_id;
-      await sendTicketNotify(env, { id: ticketId, api_type: 'other', title: '测试工单 - 邮件通知测试', description: '这是一个用于测试邮件通知功能的工单。', error_msg: null, todesk_code: '123 456 789' }, 'test@example.com');
-      return json({ ok: true, ticketId });
-    }
     if (p === '/api/test' || p === '/api/test/') {
       return json({
         name: 'test',
