@@ -404,7 +404,9 @@ function openModal(id){$('#'+id).classList.add('show');}
 function closeModal(id){$('#'+id).classList.remove('show');}
 window.closeModal=closeModal;
 function initNotify(){if('Notification' in window&&Notification.permission==='default')Notification.requestPermission();}
-function notify(title,body){if('Notification' in window&&Notification.permission==='granted')new Notification(title,{body,icon:'/favicon.ico'});}
+let audioCtx=null;
+function playNotifSound(){if(localStorage.getItem('notifSound')==='off')return;if(!audioCtx)audioCtx=new(window.AudioContext||window.webkitAudioContext)();const o=audioCtx.createOscillator(),g=audioCtx.createGain();o.connect(g);g.connect(audioCtx.destination);o.frequency.value=800;o.type='sine';g.gain.setValueAtTime(0.3,audioCtx.currentTime);g.gain.exponentialRampToValueAtTime(0.01,audioCtx.currentTime+0.3);o.start(audioCtx.currentTime);o.stop(audioCtx.currentTime+0.3);}
+function notify(title,body){if('Notification' in window&&Notification.permission==='granted'){new Notification(title,{body,icon:'/favicon.ico'});playNotifSound();}}
 `;
 }
 
@@ -419,6 +421,7 @@ function renderUserPage(user){
 <nav class="nav"><div class="nav-in">
   <div class="brand">🛟 API 中转站<small>技术支持</small></div>
   <div class="nav-right">
+    <button class="btn btn-ghost" id="soundToggle" title="通知声音">🔊</button>
     ${user ? `<span class="chip">👤 ${esc(user.email)}</span><button class="btn btn-ghost" id="logoutBtn">退出</button>`
            : `<a class="btn btn-primary" href="/fd#login">登录</a>`}
   </div>
@@ -496,6 +499,10 @@ function renderUserPage(user){
 ${commonJs()}
 const STATE = { user: ${user ? JSON.stringify({id:user.id,email:user.email,role:user.role}) : 'null'}, tickets: [], prevTickets: {}, chatId:null, lastMsgId:0, pollTimer:null };
 initNotify();
+const soundBtn=$('#soundToggle');
+function updateSoundBtn(){soundBtn.textContent=localStorage.getItem('notifSound')==='off'?'🔇':'🔊';}
+updateSoundBtn();
+soundBtn.onclick=()=>{localStorage.setItem('notifSound',localStorage.getItem('notifSound')==='off'?'':'off');updateSoundBtn();};
 
 $('#authForm')?.addEventListener('submit', async e=>{
   e.preventDefault();
@@ -659,6 +666,7 @@ function renderWorkerPage(user){
 <nav class="nav"><div class="nav-in">
   <div class="brand">🛠️ API 中转站<small>接单后台</small></div>
   <div class="nav-right">
+    <button class="btn btn-ghost" id="soundToggle" title="通知声音">🔊</button>
     ${user ? `<span class="chip">🔧 ${esc(user.email)}</span><button class="btn btn-ghost" id="logoutBtn">退出</button>`
            : `<a class="btn btn-primary" href="/jd#login">登录</a>`}
   </div>
@@ -716,6 +724,10 @@ function renderWorkerPage(user){
 ${commonJs()}
 const STATE={ user:${user?JSON.stringify({id:user.id,email:user.email,role:user.role}):'null'}, mode:'login', view:'open', tickets:[], prevTicketCount:0, chatId:null, lastMsgId:0, poll:null };
 initNotify();
+const soundBtn=$('#soundToggle');
+function updateSoundBtn(){soundBtn.textContent=localStorage.getItem('notifSound')==='off'?'🔇':'🔊';}
+updateSoundBtn();
+soundBtn.onclick=()=>{localStorage.setItem('notifSound',localStorage.getItem('notifSound')==='off'?'':'off');updateSoundBtn();};
 
 $$('.tab').forEach(t=>t.onclick=()=>{
   if(t.dataset.view!==undefined){ STATE.view=t.dataset.view; $$('.tab').forEach(x=>x.classList.toggle('active',x===t)); renderList(); return; }
