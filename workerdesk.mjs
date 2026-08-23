@@ -68,7 +68,6 @@ const setCookie = t => `wd_sid=${t}; Path=/; HttpOnly; Secure; SameSite=Lax; Max
 // 清除cookie
 const clrCookie = ()=> 'wd_sid=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0';
 
-// =============== 缓存工具函数 ===============
 // 获取缓存
 async function getCache(env, key) {
   try {
@@ -322,7 +321,7 @@ async function handleListOpenTickets(req, env){
   
   const { results } = await env.DB.prepare(
     `SELECT t.id, t.api_type, t.title, t.description, t.error_msg, t.status, t.created_at, t.claimed_at,
-            u.email AS user_email, w.email AS worker_email
+            t.todesk_code, u.email AS user_email, w.email AS worker_email
      FROM tickets t JOIN users u ON u.id=t.user_id LEFT JOIN users w ON w.id=t.worker_id
      WHERE t.status IN ('open','claimed') ORDER BY t.id DESC LIMIT 200`
   ).all();
@@ -504,9 +503,84 @@ async function handleGetMsgs(req, env, ticketId, afterId){
   return json({ messages: results || [], me: u.id });
 }
 
-// =============== 聊天图片 ===============
+// =============== 聊天图片（Filebase S3 存储） ===============
 const IMG_MAX_SIZE = 5 * 1024 * 1024; // 5MB
 const IMG_TYPES = { 'image/jpeg':'jpg', 'image/png':'png', 'image/gif':'gif', 'image/webp':'webp' };
+
+// ---- SigV4 签名辅助 ----
+const FB_ENDPOINT = 's3.filebase.com';
+const FB_REGION = 'us-east-1';
+const FB_BUCKET = 'workerdesk-images-goutou';
+
+function _encRfc3986(s){
+  return encodeURIComponent(s).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+}
+async function _sha256Hex(data){
+  const h = await crypto.subtle.digest('SHA-256', data);
+  return [...new Uint8Array(h)].map(b => b.toString(16).padStart(2,'0')).join('');
+}
+async function _hmac(key, data){
+  const k = key instanceof Uint8Array ? key : new TextEncoder().encode(key);
+  const c = await crypto.subtle.importKey('raw', k, { name:'HMAC', hash:'SHA-256' }, false, ['sign']);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', c, new TextEncoder().encode(data)));
+}
+// method/path/queryParams/body 均为原始值；返回 fetch Response
+async function fbRequest(env, method, path, queryParams, body, contentType){
+  const ak = env.FILEBASE_ACCESS_KEY, sk = env.FILEBASE_SECRET_KEY;
+  if (!ak || !sk) throw new Error('Filebase 未配置');
+  const now = new Date();
+  const amzdate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
+  const datestamp = amzdate.substring(0, 8);
+  const payloadHash = await _sha256Hex(body || new Uint8Array(0));
+
+  const headers = {
+    'host': FB_ENDPOINT,
+    'x-amz-content-sha256': payloadHash,
+    'x-amz-date': amzdate
+  };
+  const sortedHeaders = Object.keys(headers).sort();
+  const canonicalHeaders = sortedHeaders.map(k => `${k}:${headers[k]}\n`).join('');
+  const signedHeaders = sortedHeaders.join(';');
+
+  // 规范化查询串：按 key 排序、RFC3986 编码
+  const qs = Object.entries(queryParams || {})
+    .map(([k,v]) => [_encRfc3986(k), _encRfc3986(v)])
+    .sort((a,b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)
+    .map(([k,v]) => `${k}=${v}`).join('&');
+
+  const canonicalRequest = [method, path, qs, canonicalHeaders, signedHeaders, payloadHash].join('\n');
+  const scope = `${datestamp}/${FB_REGION}/s3/aws4_request`;
+  const stringToSign = ['AWS4-HMAC-SHA256', amzdate, scope, await _sha256Hex(new TextEncoder().encode(canonicalRequest))].join('\n');
+
+  let signKey = await _hmac('AWS4' + sk, datestamp);
+  signKey = await _hmac(signKey, FB_REGION);
+  signKey = await _hmac(signKey, 's3');
+  signKey = await _hmac(signKey, 'aws4_request');
+  const signature = [...await _hmac(signKey, stringToSign)].map(b => b.toString(16).padStart(2,'0')).join('');
+  const authHeader = `AWS4-HMAC-SHA256 Credential=${ak}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+
+  const reqHeaders = { ...headers, 'Authorization': authHeader };
+  if (contentType) reqHeaders['Content-Type'] = contentType;
+  return fetch(`https://${FB_ENDPOINT}${path}${qs ? '?' + qs : ''}`, {
+    method, headers: reqHeaders, body: body || undefined
+  });
+}
+
+// 删除指定前缀下的所有对象（分页遍历）
+async function fbDeletePrefix(env, prefix){
+  let token = '';
+  do {
+    const params = { 'list-type':'2', 'prefix': prefix };
+    if (token) params['continuation-token'] = token;
+    const r = await fbRequest(env, 'GET', '/' + FB_BUCKET, params);
+    if (!r.ok) { console.log('FB_LIST_ERR', r.status, await r.text()); break; }
+    const xml = await r.text();
+    const keys = [...xml.matchAll(/<Key>([^<]+)<\/Key>/g)].map(m => m[1]);
+    const tm = xml.match(/<NextContinuationToken>([^<]+)<\/NextContinuationToken>/);
+    token = tm ? tm[1] : '';
+    await Promise.all(keys.map(k => fbRequest(env, 'DELETE', '/' + FB_BUCKET + '/' + k)));
+  } while (token);
+}
 
 async function handleUploadImage(req, env, ticketId){
   const u = await session(req, env);
@@ -537,7 +611,8 @@ async function handleUploadImage(req, env, ticketId){
   if (!valid) return json({error:'文件内容与格式不符'},400);
 
   const imgKey = 'img/' + ticketId + '/' + crypto.randomUUID() + '.' + IMG_TYPES[ctype];
-  await env.IMAGES.put(imgKey, buf, { metadata: { contentType: ctype, ticket: String(ticketId) } });
+  const pr = await fbRequest(env, 'PUT', '/' + FB_BUCKET + '/' + imgKey, null, buf, ctype);
+  if (!pr.ok) { console.log('FB_PUT_ERR', pr.status, await pr.text()); return json({error:'图片存储失败，请重试'},500); }
 
   const r = await env.DB.prepare('INSERT INTO messages (ticket_id, sender_id, content, image_key) VALUES (?,?,?,?)')
     .bind(ticketId, u.id, '[图片]', imgKey).run();
@@ -554,13 +629,14 @@ async function handleGetImage(req, env, msgId){
   if (!m || !m.image_key) return json({error:'图片不存在'},404);
   if (t_check(u, m)) return json({error:'无权限'},403);
 
-  const obj = await env.IMAGES.getWithMetadata(m.image_key);
-  if (!obj.value) return json({error:'图片已被清理'},404);
-  const headers = {
-    'Content-Type': obj.metadata?.contentType || 'application/octet-stream',
-    'Cache-Control': 'private, max-age=3600'
-  };
-  return new Response(obj.value, { headers });
+  const r = await fbRequest(env, 'GET', '/' + FB_BUCKET + '/' + m.image_key);
+  if (!r.ok) return json({error:'图片已被清理'},404);
+  return new Response(r.body, {
+    headers: {
+      'Content-Type': r.headers.get('content-type') || 'application/octet-stream',
+      'Cache-Control': 'private, max-age=3600'
+    }
+  });
 }
 
 function t_check(u, m){
@@ -569,26 +645,12 @@ function t_check(u, m){
 
 // 工单完成时删除该工单全部聊天图片（保留消息记录，前端显示"图片已清理"）
 async function deleteTicketImages(env, ticketId){
-  await listAndDelete(env, 'img/' + ticketId + '/');
+  await fbDeletePrefix(env, 'img/' + ticketId + '/');
 }
 
 // 清空所有聊天图片
 async function deleteAllImages(env){
-  await listAndDelete(env, 'img/');
-  await env.DB.prepare('UPDATE messages SET image_key=NULL WHERE image_key IS NOT NULL').run();
-}
-
-async function listAndDelete(env, prefix){
-  try {
-    let cursor;
-    do {
-      const list = await env.IMAGES.list({ prefix, cursor: cursor || undefined });
-      await Promise.all(list.keys.map(k => env.IMAGES.delete(k.name)));
-      cursor = list.list_complete ? null : list.cursor;
-    } while (cursor);
-  } catch(e) {
-    console.log('DELETE_IMAGES_ERROR', e);
-  }
+  await fbDeletePrefix(env, 'img/');
 }
 
 // =============== HTML pages ===============
@@ -1184,8 +1246,7 @@ function renderList(){
     else if(t.status==='claimed'){
       const mine=t.worker_email===STATE.user.email;
       if(mine)act='<button class="btn btn-primary" data-act="chat" data-id="'+t.id+'">💬 联系发单方</button>'
-        +'<button class="btn btn-ghost" data-act="release" data-id="'+t.id+'">放弃</button>'
-        +'<button class="btn btn-primary" data-act="request_complete" data-id="'+t.id+'">请求完成</button>';
+        +'<button class="btn btn-ghost" data-act="release" data-id="'+t.id+'">放弃</button>';
       else act='<span class="pill">已被他人接走</span>';
     } else if(t.status==='pending_close'){
       const mine=t.worker_email===STATE.user.email;
@@ -1215,8 +1276,7 @@ document.addEventListener('click',async e=>{
   b.disabled=true;
   try{
     if(act==='claim'){await api('POST','/api/tickets/'+id+'/claim');toast('接单成功','ok');}
-    else if(act==='release'){if(!confirm('放弃此工单？')){b.disabled=false;return;}await api('POST','/api/tickets/'+id+'/release');toast('已放弃','ok');}
-    else if(act==='request_complete'){if(!confirm('请求发单方确认完成？')){b.disabled=false;return;}await api('POST','/api/tickets/'+id+'/request_complete');toast('已请求确认','ok');}
+    else if(act==='release'){if(!confirm('放弃后工单将回到待接单列表，确定放弃？')){b.disabled=false;return;}await api('POST','/api/tickets/'+id+'/release');toast('已放弃，工单已回到待接单','ok');}
     else if(act==='complete'){if(!confirm('确认标记完成？')){b.disabled=false;return;}await api('POST','/api/tickets/'+id+'/complete');toast('已完成','ok');}
     loadAll();
   }catch(err){toast(err.message,'err');b.disabled=false;}
@@ -1357,19 +1417,29 @@ export default {
   // 定时任务：每天清理前一天的订单
   async scheduled(event, env, ctx) {
     try {
+      // 先找出待清理的工单，删除其聊天图片（Filebase）
+      const { results } = await env.DB.prepare(`
+        SELECT id FROM tickets
+        WHERE status IN ('closed', 'completed')
+        AND created_at < datetime('now', '-1 day')
+      `).all();
+      for (const row of (results || [])) {
+        await deleteTicketImages(env, row.id);
+      }
+
       // 删除昨天及更早的已关闭/已完成工单
       await env.DB.prepare(`
-        DELETE FROM tickets 
-        WHERE status IN ('closed', 'completed') 
+        DELETE FROM tickets
+        WHERE status IN ('closed', 'completed')
         AND created_at < datetime('now', '-1 day')
       `).run();
-      
+
       // 删除相关的消息
       await env.DB.prepare(`
-        DELETE FROM messages 
+        DELETE FROM messages
         WHERE ticket_id NOT IN (SELECT id FROM tickets)
       `).run();
-      
+
       console.log('Daily cleanup completed');
     } catch (e) {
       console.log('Cleanup error:', e);
