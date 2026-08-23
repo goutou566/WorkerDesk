@@ -21,10 +21,11 @@ const API_TYPES = [
 
 // 工单状态定义
 const TICKET_STATUS = {
-  open:      { name: '待接单', color: '#22c55e', dot: '🟢' },
-  claimed:   { name: '处理中', color: '#3b82f6', dot: '🔵' },
-  completed: { name: '已完成', color: '#94a3b8', dot: '✅' },
-  closed:    { name: '已关闭', color: '#6b7280', dot: '⚫' }
+  open:          { name: '待接单', color: '#22c55e', dot: '🟢' },
+  claimed:       { name: '处理中', color: '#3b82f6', dot: '🔵' },
+  pending_close: { name: '待确认完成', color: '#f59e0b', dot: '🟡' },
+  completed:     { name: '已完成', color: '#94a3b8', dot: '✅' },
+  closed:        { name: '已关闭', color: '#6b7280', dot: '⚫' }
 };
 
 // 缓存键定义
@@ -341,14 +342,26 @@ async function handleTicketAction(req, env, id, action){
   if (!t) return json({error:'工单不存在'},404);
 
   if (action === 'claim') {
-    if (u.role !== 'worker') return json({error:'仅接单员可抢单'},403);
+    // 发单方和接单员都可以接单
     if (t.status !== 'open') return json({error:'该工单已被接走或关闭'},400);
     if (t.user_id === u.id) return json({error:'不能接自己的单'},400);
     await env.DB.prepare("UPDATE tickets SET status='claimed', worker_id=?, claimed_at=datetime('now') WHERE id=? AND status='open'")
       .bind(u.id, id).run();
+  } else if (action === 'request_complete') {
+    // 接单方请求完成，需要发单方同意
+    if (t.worker_id !== u.id) return json({error:'仅接单员可请求完成'},403);
+    if (t.status !== 'claimed') return json({error:'当前状态不可请求完成'},400);
+    await env.DB.prepare("UPDATE tickets SET status='pending_close' WHERE id=?").bind(id).run();
   } else if (action === 'complete') {
-    if (t.worker_id !== u.id) return json({error:'仅接单员可标记完成'},403);
-    if (t.status !== 'claimed') return json({error:'当前状态不可完成'},400);
+    // 发单方直接完成（发单方可以随时完成）
+    if (t.user_id === u.id) {
+      if (t.status !== 'claimed' && t.status !== 'pending_close') return json({error:'当前状态不可完成'},400);
+    } else if (t.worker_id === u.id) {
+      // 接单方需要发单方同意
+      if (t.status !== 'pending_close') return json({error:'需要发单方同意才能完成'},400);
+    } else {
+      return json({error:'无权限'},403);
+    }
     await env.DB.prepare("UPDATE tickets SET status='completed', completed_at=datetime('now') WHERE id=?").bind(id).run();
   } else if (action === 'close') {
     if (t.user_id !== u.id) return json({error:'仅发单方可关闭'},403);
@@ -358,6 +371,11 @@ async function handleTicketAction(req, env, id, action){
     if (t.worker_id !== u.id) return json({error:'仅接单方可放弃'},403);
     if (t.status !== 'claimed') return json({error:'当前状态不可放弃'},400);
     await env.DB.prepare("UPDATE tickets SET status='open', worker_id=NULL, claimed_at=NULL WHERE id=?").bind(id).run();
+  } else if (action === 'delete_all') {
+    // 删除所有订单（仅管理员或发单方）
+    if (u.role !== 'worker') return json({error:'无权限'},403);
+    await env.DB.prepare("DELETE FROM tickets").run();
+    await env.DB.prepare("DELETE FROM messages").run();
   } else return json({error:'未知操作'},400);
 
   // Invalidate related caches
@@ -778,10 +796,20 @@ function renderTickets(){
   box.innerHTML=STATE.tickets.map(t=>{
     let actions='';
     if(t.status==='open'){
-      actions='<button class="btn btn-ghost" data-act="close" data-id="'+t.id+'">关闭工单</button>';
-    } else if(t.status==='claimed'||t.status==='completed'){
-      actions='<button class="btn btn-primary" data-act="chat" data-id="'+t.id+'">💬 联系接单员</button>'
-        + (t.status==='claimed'?'<button class="btn btn-ghost" data-act="close" data-id="'+t.id+'">关闭</button>':'');
+      // 发单方可以自己接单
+      actions='<button class="btn btn-primary" data-act="claim" data-id="'+t.id+'">自己处理</button>'
+        +'<button class="btn btn-ghost" data-act="close" data-id="'+t.id+'">关闭</button>';
+    } else if(t.status==='claimed'){
+      actions='<button class="btn btn-primary" data-act="chat" data-id="'+t.id+'">💬 联系</button>'
+        +'<button class="btn btn-primary" data-act="complete" data-id="'+t.id+'">确认完成</button>'
+        +'<button class="btn btn-ghost" data-act="close" data-id="'+t.id+'">关闭</button>';
+    } else if(t.status==='pending_close'){
+      // 接单方请求完成，发单方确认
+      actions='<button class="btn btn-primary" data-act="chat" data-id="'+t.id+'">💬 联系</button>'
+        +'<button class="btn btn-primary" data-act="complete" data-id="'+t.id+'">确认完成</button>'
+        +'<button class="btn btn-ghost" data-act="close" data-id="'+t.id+'">关闭</button>';
+    } else if(t.status==='completed'){
+      actions='<button class="btn btn-primary" data-act="chat" data-id="'+t.id+'">💬 联系</button>';
     }
     const worker = t.worker_email ? '<span class="meta-item">🔧 '+esc(t.worker_email)+'</span>' : '';
     let ratingHtml='';
@@ -827,6 +855,18 @@ document.addEventListener('click', async e=>{
   const b=e.target.closest('[data-act]');if(!b)return;
   const id=+b.dataset.id,act=b.dataset.act;
   if(act==='chat'){openChat(id);return;}
+  if(act==='claim'){
+    if(!confirm('确定要自己处理这个工单？'))return;
+    b.disabled=true;
+    try{await api('POST','/api/tickets/'+id+'/claim');toast('已接单','ok');loadTickets();}
+    catch(err){toast(err.message,'err');b.disabled=false;}
+  }
+  if(act==='complete'){
+    if(!confirm('确定这个工单已完成？'))return;
+    b.disabled=true;
+    try{await api('POST','/api/tickets/'+id+'/complete');toast('已完成','ok');loadTickets();}
+    catch(err){toast(err.message,'err');b.disabled=false;}
+  }
   if(act==='close'){
     if(!confirm('确定关闭这个工单？'))return;
     b.disabled=true;
@@ -934,6 +974,7 @@ function renderWorkerPage(user){
       <button class="tab" data-view="mine">我接的</button>
     </div>
     <button class="btn btn-ghost" id="refreshBtn">↻ 刷新</button>
+    <button class="btn btn-ghost" id="clearAllBtn" style="color:#ef4444">🗑️ 清空</button>
   </div>
   <div id="ticketList"></div>`}
 </div>
@@ -982,6 +1023,11 @@ $('#authForm')?.addEventListener('submit',async e=>{
 
 $('#logoutBtn')?.addEventListener('click',async()=>{await api('POST','/api/auth/logout');location.reload();});
 $('#refreshBtn')?.addEventListener('click',loadAll);
+$('#clearAllBtn')?.addEventListener('click',async()=>{
+  if(!confirm('确定要删除所有工单？此操作不可恢复！'))return;
+  try{await api('POST','/api/tickets/1/delete_all');toast('已清空','ok');loadAll();}
+  catch(err){toast(err.message,'err');}
+});
 
 async function loadAll(){
   try{
@@ -1012,7 +1058,7 @@ function renderList(){
   const box=$('#ticketList');if(!box)return;
   let ts=STATE.tickets;
   if(STATE.view==='open')ts=ts.filter(t=>t.status==='open');
-  else if(STATE.view==='claimed')ts=ts.filter(t=>t.status==='claimed');
+  else if(STATE.view==='claimed')ts=ts.filter(t=>t.status==='claimed'||t.status==='pending_close');
   else if(STATE.view==='mine')ts=ts.filter(t=>t.worker_email && t.worker_email===STATE.user.email);
   if(!ts.length){box.innerHTML='<div class="empty"><div class="ic">📭</div><p>暂无工单</p></div>';return;}
   box.innerHTML=ts.map(t=>{
@@ -1022,8 +1068,13 @@ function renderList(){
       const mine=t.worker_email===STATE.user.email;
       if(mine)act='<button class="btn btn-primary" data-act="chat" data-id="'+t.id+'">💬 联系发单方</button>'
         +'<button class="btn btn-ghost" data-act="release" data-id="'+t.id+'">放弃</button>'
-        +'<button class="btn btn-ghost" data-act="complete" data-id="'+t.id+'">完成</button>';
+        +'<button class="btn btn-primary" data-act="request_complete" data-id="'+t.id+'">请求完成</button>';
       else act='<span class="pill">已被他人接走</span>';
+    } else if(t.status==='pending_close'){
+      const mine=t.worker_email===STATE.user.email;
+      if(mine)act='<button class="btn btn-primary" data-act="chat" data-id="'+t.id+'">💬 联系发单方</button>'
+        +'<span class="pill">等待发单方确认</span>';
+      else act='<span class="pill">等待确认</span>';
     }
     const u=t.user_email?'<span>👤 '+esc(t.user_email)+'</span>':'';
     const todesk=(t.status==='claimed'&&t.worker_email===STATE.user.email)?'<div class="card" style="padding:10px 12px;margin:8px 0;background:rgba(16,185,129,.08);border-color:rgba(16,185,129,.3)"><b>🖥️ ToDesk:</b> '+esc(t.todesk_code||'(未提供)')+'</div>':'';
@@ -1048,6 +1099,7 @@ document.addEventListener('click',async e=>{
   try{
     if(act==='claim'){await api('POST','/api/tickets/'+id+'/claim');toast('接单成功','ok');}
     else if(act==='release'){if(!confirm('放弃此工单？')){b.disabled=false;return;}await api('POST','/api/tickets/'+id+'/release');toast('已放弃','ok');}
+    else if(act==='request_complete'){if(!confirm('请求发单方确认完成？')){b.disabled=false;return;}await api('POST','/api/tickets/'+id+'/request_complete');toast('已请求确认','ok');}
     else if(act==='complete'){if(!confirm('确认标记完成？')){b.disabled=false;return;}await api('POST','/api/tickets/'+id+'/complete');toast('已完成','ok');}
     loadAll();
   }catch(err){toast(err.message,'err');b.disabled=false;}
@@ -1160,5 +1212,27 @@ export default {
 
     // SPA fallback → /fd
     return Response.redirect(ORIGIN+'/fd', 302);
+  },
+  
+  // 定时任务：每天清理前一天的订单
+  async scheduled(event, env, ctx) {
+    try {
+      // 删除昨天及更早的已关闭/已完成工单
+      await env.DB.prepare(`
+        DELETE FROM tickets 
+        WHERE status IN ('closed', 'completed') 
+        AND created_at < datetime('now', '-1 day')
+      `).run();
+      
+      // 删除相关的消息
+      await env.DB.prepare(`
+        DELETE FROM messages 
+        WHERE ticket_id NOT IN (SELECT id FROM tickets)
+      `).run();
+      
+      console.log('Daily cleanup completed');
+    } catch (e) {
+      console.log('Cleanup error:', e);
+    }
   }
 };
