@@ -877,7 +877,7 @@ async function sendMsg(){
 
 $('#fabTop').onclick=()=>window.scrollTo({top:0,behavior:'smooth'});
 
-if(STATE.user){ loadTickets(); PollManager.start('userTickets', loadTickets, 5000); }
+if(STATE.user){ loadTickets(); PollManager.start('userTickets', loadTickets, 2000); }
 </script>
 </body></html>`;
 }
@@ -1084,7 +1084,7 @@ async function sendMsg(){
   catch(e){toast(e.message,'err');inp.value=v;}
 }
 
-if(STATE.user){ loadAll(); PollManager.start('workerTickets', loadAll, 5000); }
+if(STATE.user){ loadAll(); PollManager.start('workerTickets', loadAll, 2000); }
 </script>
 </body></html>`;
 }
