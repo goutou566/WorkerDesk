@@ -340,6 +340,7 @@ async function handleTicketAction(req, env, id, action){
   if (!u) return json({error:'未登录'},401);
   const t = await env.DB.prepare('SELECT * FROM tickets WHERE id=?').bind(id).first();
   if (!t) return json({error:'工单不存在'},404);
+  let ctx_wait = null;
 
   if (action === 'claim') {
     // 发单方和接单员都可以接单（发单方接自己的单=自己处理）
@@ -362,6 +363,8 @@ async function handleTicketAction(req, env, id, action){
       return json({error:'无权限'},403);
     }
     await env.DB.prepare("UPDATE tickets SET status='completed', completed_at=datetime('now') WHERE id=?").bind(id).run();
+    // 工单完成，删除该工单的全部聊天图片
+    ctx_wait = deleteTicketImages(env, id);
   } else if (action === 'close') {
     if (t.user_id !== u.id) return json({error:'仅发单方可关闭'},403);
     if (t.status === 'closed') return json({error:'已关闭'},400);
@@ -371,10 +374,11 @@ async function handleTicketAction(req, env, id, action){
     if (t.status !== 'claimed') return json({error:'当前状态不可放弃'},400);
     await env.DB.prepare("UPDATE tickets SET status='open', worker_id=NULL, claimed_at=NULL WHERE id=?").bind(id).run();
   } else if (action === 'delete_all') {
-    // 删除所有订单（仅管理员或发单方）
+    // 删除所有订单（仅接单员）
     if (u.role !== 'worker') return json({error:'无权限'},403);
     await env.DB.prepare("DELETE FROM tickets").run();
     await env.DB.prepare("DELETE FROM messages").run();
+    ctx_wait = deleteAllImages(env);
   } else return json({error:'未知操作'},400);
 
   // Invalidate related caches
@@ -386,6 +390,9 @@ async function handleTicketAction(req, env, id, action){
   if (u.role === 'worker') {
     await invalidateCache(env, CACHE_KEYS.WORKER_STATS + u.id);
   }
+
+  // 等待图片清理完成（工单完成场景）
+  if (ctx_wait) await ctx_wait;
 
   return json({ok:true});
 }
@@ -489,12 +496,99 @@ async function handleGetMsgs(req, env, ticketId, afterId){
   const t = await env.DB.prepare('SELECT * FROM tickets WHERE id=?').bind(ticketId).first();
   if (!t) return json({error:'工单不存在'},404);
   if (t.user_id !== u.id && t.worker_id !== u.id) return json({error:'无权限'},403);
-  let sql = 'SELECT id, sender_id, content, created_at FROM messages WHERE ticket_id=?';
+  let sql = 'SELECT id, sender_id, content, image_key, created_at FROM messages WHERE ticket_id=?';
   const params = [ticketId];
   if (afterId) { sql += ' AND id>?'; params.push(afterId); }
   sql += ' ORDER BY id ASC LIMIT 200';
   const { results } = await env.DB.prepare(sql).bind(...params).all();
   return json({ messages: results || [], me: u.id });
+}
+
+// =============== 聊天图片 ===============
+const IMG_MAX_SIZE = 5 * 1024 * 1024; // 5MB
+const IMG_TYPES = { 'image/jpeg':'jpg', 'image/png':'png', 'image/gif':'gif', 'image/webp':'webp' };
+
+async function handleUploadImage(req, env, ticketId){
+  const u = await session(req, env);
+  if (!u) return json({error:'未登录'},401);
+  const t = await env.DB.prepare('SELECT * FROM tickets WHERE id=?').bind(ticketId).first();
+  if (!t) return json({error:'工单不存在'},404);
+  if (t.user_id !== u.id && t.worker_id !== u.id) return json({error:'无权限'},403);
+  if (!['claimed','pending_close'].includes(t.status)) return json({error:'工单未在进行中，无法发图'},400);
+
+  let form;
+  try { form = await req.formData(); } catch(e){ return json({error:'表单格式错误'},400); }
+  const file = form.get('file');
+  if (!file || typeof file === 'string') return json({error:'缺少图片文件'},400);
+
+  const ctype = file.type;
+  if (!IMG_TYPES[ctype]) return json({error:'仅支持 jpg/png/gif/webp 格式'},400);
+  if (file.size > IMG_MAX_SIZE) return json({error:'图片最大 5MB'},400);
+  if (file.size === 0) return json({error:'图片为空'},400);
+
+  const buf = await file.arrayBuffer();
+  // 二次校验魔数，防止伪造 Content-Type 上传恶意文件
+  const sig = new Uint8Array(buf.slice(0,12));
+  const isJpg = sig[0]===0xFF && sig[1]===0xD8;
+  const isPng = sig[0]===0x89 && sig[1]===0x50 && sig[2]===0x4E && sig[3]===0x47;
+  const isGif = sig[0]===0x47 && sig[1]===0x49 && sig[2]===0x46;
+  const isWebp = sig[8]===0x57 && sig[9]===0x45 && sig[10]===0x42 && sig[11]===0x50; // RIFF....WEBP
+  const valid = (ctype==='image/jpeg'&&isJpg)||(ctype==='image/png'&&isPng)||(ctype==='image/gif'&&isGif)||(ctype==='image/webp'&&isWebp);
+  if (!valid) return json({error:'文件内容与格式不符'},400);
+
+  const imgKey = 'img/' + ticketId + '/' + crypto.randomUUID() + '.' + IMG_TYPES[ctype];
+  await env.IMAGES.put(imgKey, buf, { metadata: { contentType: ctype, ticket: String(ticketId) } });
+
+  const r = await env.DB.prepare('INSERT INTO messages (ticket_id, sender_id, content, image_key) VALUES (?,?,?,?)')
+    .bind(ticketId, u.id, '[图片]', imgKey).run();
+
+  await invalidateCache(env, CACHE_KEYS.TICKET_LIST);
+  return json({ id: r.meta.last_row_id, image_key: imgKey });
+}
+
+async function handleGetImage(req, env, msgId){
+  const u = await session(req, env);
+  if (!u) return json({error:'未登录'},401);
+  const m = await env.DB.prepare('SELECT m.image_key, m.ticket_id, t.user_id, t.worker_id FROM messages m JOIN tickets t ON t.id=m.ticket_id WHERE m.id=?')
+    .bind(msgId).first();
+  if (!m || !m.image_key) return json({error:'图片不存在'},404);
+  if (t_check(u, m)) return json({error:'无权限'},403);
+
+  const obj = await env.IMAGES.getWithMetadata(m.image_key);
+  if (!obj.value) return json({error:'图片已被清理'},404);
+  const headers = {
+    'Content-Type': obj.metadata?.contentType || 'application/octet-stream',
+    'Cache-Control': 'private, max-age=3600'
+  };
+  return new Response(obj.value, { headers });
+}
+
+function t_check(u, m){
+  return m.user_id !== u.id && m.worker_id !== u.id;
+}
+
+// 工单完成时删除该工单全部聊天图片（保留消息记录，前端显示"图片已清理"）
+async function deleteTicketImages(env, ticketId){
+  await listAndDelete(env, 'img/' + ticketId + '/');
+}
+
+// 清空所有聊天图片
+async function deleteAllImages(env){
+  await listAndDelete(env, 'img/');
+  await env.DB.prepare('UPDATE messages SET image_key=NULL WHERE image_key IS NOT NULL').run();
+}
+
+async function listAndDelete(env, prefix){
+  try {
+    let cursor;
+    do {
+      const list = await env.IMAGES.list({ prefix, cursor: cursor || undefined });
+      await Promise.all(list.keys.map(k => env.IMAGES.delete(k.name)));
+      cursor = list.list_complete ? null : list.cursor;
+    } while (cursor);
+  } catch(e) {
+    console.log('DELETE_IMAGES_ERROR', e);
+  }
 }
 
 // =============== HTML pages ===============
@@ -578,6 +672,10 @@ a{color:var(--accent);text-decoration:none}
 .chat-input{padding:10px 12px;border-top:1px solid var(--border);display:flex;gap:8px;background:var(--bg2)}
 .chat-input input{flex:1;padding:11px 14px;background:rgba(255,255,255,.04);border:1px solid var(--border);border-radius:22px;color:var(--text);font-size:.95rem;font-family:inherit}
 .chat-input input:focus{outline:none;border-color:var(--accent)}
+.chat-input .img-btn{width:44px;height:44px;border-radius:50%;border:none;background:rgba(255,255,255,.06);color:var(--text);font-size:1.15rem;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;user-select:none}
+.chat-input .img-btn:hover{background:rgba(255,255,255,.12)}
+.chat-img{max-width:min(220px,60vw);max-height:220px;border-radius:10px;cursor:zoom-in;display:block;margin-bottom:4px}
+.img-deleted{font-size:.85rem;color:inherit;opacity:.65;font-style:italic}
 .chat-input button{width:44px;height:44px;border-radius:50%;border:none;background:var(--accent);color:#fff;font-size:1.1rem;cursor:center;display:flex;align-items:center;justify-content:center}
 .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(100px);background:var(--bg2);border:1px solid var(--border);color:var(--text);padding:12px 20px;border-radius:var(--radius-sm);z-index:300;transition:transform .3s;box-shadow:0 10px 30px rgba(0,0,0,.4);max-width:90vw;font-size:.9rem}
 .toast.show{transform:translateX(-50%) translateY(0)}
@@ -605,7 +703,7 @@ const $$=(s,r=document)=>[...r.querySelectorAll(s)];
 function toast(msg,type){const t=$('#toast');t.textContent=msg;t.className='toast show '+(type||'');clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('show'),2500);}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function fmtRel(s){if(!s)return'';const d=new Date(s.replace(' ','T')+'Z').getTime();const diff=(Date.now()-d)/1000;if(diff<60)return'刚刚';if(diff<3600)return Math.floor(diff/60)+'分钟前';if(diff<86400)return Math.floor(diff/3600)+'小时前';if(diff<604800)return Math.floor(diff/86400)+'天前';return s.substring(5,16);}
-async function api(m,p,b){const o={method:m,headers:{}};if(b){o.headers['Content-Type']='application/json';o.body=JSON.stringify(b);}const r=await fetch(p,o);let d;try{d=await r.json();}catch{d={};}if(!r.ok)throw new Error(d.error||('HTTP '+r.status));return d;}
+async function api(m,p,b){const o={method:m,headers:{}};if(b){if(b instanceof FormData){o.body=b;}else{o.headers['Content-Type']='application/json';o.body=JSON.stringify(b);}}const r=await fetch(p,o);let d;try{d=await r.json();}catch{d={};}if(!r.ok)throw new Error(d.error||('HTTP '+r.status));return d;}
 function openModal(id){$('#'+id).classList.add('show');}
 function closeModal(id){$('#'+id).classList.remove('show');}
 window.closeModal=closeModal;
@@ -737,6 +835,7 @@ function renderUserPage(user){
   </div>
   <div class="chat-msgs" id="chatMsgs"></div>
   <div class="chat-input">
+    <label class="img-btn" id="chatImgBtn" title="发送图片">🖼️<input type="file" id="chatImgInput" accept="image/jpeg,image/png,image/gif,image/webp" hidden/></label>
     <input id="chatInput" placeholder="输入消息..." maxlength="1000"/>
     <button id="chatSend">➤</button>
   </div>
@@ -898,13 +997,30 @@ async function pollMsgs(){
       if(m.id<=STATE.lastMsgId)return;STATE.lastMsgId=m.id;
       const me=m.sender_id===STATE.user.id;
       const div=document.createElement('div');div.className='msg '+(me?'me':'them');
-      div.innerHTML=esc(m.content)+'<span class="time">'+fmtRel(m.created_at)+'</span>';
+      if(m.image_key){
+        div.innerHTML='<img class="chat-img" loading="lazy" alt="[图片]" src="/api/images/'+m.id+'"/><span class="time">'+fmtRel(m.created_at)+'</span>';
+        const im=div.querySelector('.chat-img');
+        im.onclick=()=>window.open('/api/images/'+m.id,'_blank');
+        im.onerror=function(){this.outerHTML='<span class="img-deleted">图片已清理</span>';};
+        if(!me)notify('新消息','#'+STATE.chatId+': [图片]');
+      }else{
+        div.innerHTML=esc(m.content)+'<span class="time">'+fmtRel(m.created_at)+'</span>';
+        if(!me)notify('新消息','#'+STATE.chatId+': '+m.content.substring(0,50));
+      }
       $('#chatMsgs').appendChild(div);
-      if(!me)notify('新消息','#'+STATE.chatId+': '+m.content.substring(0,50));
     });
     if(d.messages&&d.messages.length)$('#chatMsgs').scrollTop=$('#chatMsgs').scrollHeight;
   }catch(e){}
 }
+$('#chatImgInput')?.addEventListener('change',async e=>{
+  const f=e.target.files[0];if(!f||!STATE.chatId)return;
+  if(f.size>5*1024*1024){toast('图片最大 5MB','err');e.target.value='';return;}
+  const fd=new FormData();fd.append('file',f);
+  const b=$('#chatImgBtn');b.style.opacity=.45;
+  try{await api('POST','/api/tickets/'+STATE.chatId+'/images',fd);toast('图片已发送','ok');pollMsgs();}
+  catch(err){toast(err.message,'err');}
+  b.style.opacity=1;e.target.value='';
+});
 $('#chatSend').onclick=sendMsg;
 $('#chatInput').addEventListener('keydown',e=>{if(e.key==='Enter')sendMsg();});
 async function sendMsg(){
@@ -981,7 +1097,9 @@ function renderWorkerPage(user){
 <div class="chat-box" id="chatBox">
   <div class="chat-head"><button class="chat-back" id="chatBack">←</button><div class="chat-title" id="chatTitle">对话</div></div>
   <div class="chat-msgs" id="chatMsgs"></div>
-  <div class="chat-input"><input id="chatInput" placeholder="输入消息..." maxlength="1000"/><button id="chatSend">➤</button></div>
+  <div class="chat-input">
+    <label class="img-btn" id="chatImgBtn" title="发送图片">🖼️<input type="file" id="chatImgInput" accept="image/jpeg,image/png,image/gif,image/webp" hidden/></label>
+    <input id="chatInput" placeholder="输入消息..." maxlength="1000"/><button id="chatSend">➤</button></div>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -1120,13 +1238,30 @@ async function pollMsgs(){
       if(m.id<=STATE.lastMsgId)return;STATE.lastMsgId=m.id;
       const me=m.sender_id===STATE.user.id;
       const div=document.createElement('div');div.className='msg '+(me?'me':'them');
-      div.innerHTML=esc(m.content)+'<span class="time">'+fmtRel(m.created_at)+'</span>';
+      if(m.image_key){
+        div.innerHTML='<img class="chat-img" loading="lazy" alt="[图片]" src="/api/images/'+m.id+'"/><span class="time">'+fmtRel(m.created_at)+'</span>';
+        const im=div.querySelector('.chat-img');
+        im.onclick=()=>window.open('/api/images/'+m.id,'_blank');
+        im.onerror=function(){this.outerHTML='<span class="img-deleted">图片已清理</span>';};
+        if(!me)notify('新消息','#'+STATE.chatId+': [图片]');
+      }else{
+        div.innerHTML=esc(m.content)+'<span class="time">'+fmtRel(m.created_at)+'</span>';
+        if(!me)notify('新消息','#'+STATE.chatId+': '+m.content.substring(0,50));
+      }
       $('#chatMsgs').appendChild(div);
-      if(!me)notify('新消息','#'+STATE.chatId+': '+m.content.substring(0,50));
     });
     if(d.messages&&d.messages.length)$('#chatMsgs').scrollTop=$('#chatMsgs').scrollHeight;
   }catch(e){}
 }
+$('#chatImgInput')?.addEventListener('change',async e=>{
+  const f=e.target.files[0];if(!f||!STATE.chatId)return;
+  if(f.size>5*1024*1024){toast('图片最大 5MB','err');e.target.value='';return;}
+  const fd=new FormData();fd.append('file',f);
+  const b=$('#chatImgBtn');b.style.opacity=.45;
+  try{await api('POST','/api/tickets/'+STATE.chatId+'/images',fd);toast('图片已发送','ok');pollMsgs();}
+  catch(err){toast(err.message,'err');}
+  b.style.opacity=1;e.target.value='';
+});
 $('#chatSend').onclick=sendMsg;
 $('#chatInput').addEventListener('keydown',e=>{if(e.key==='Enter')sendMsg();});
 async function sendMsg(){
@@ -1165,12 +1300,18 @@ export default {
     if (m = p.match(/^\/api\/tickets\/(\d+)$/)) {
       if (req.method==='GET') return handleTicketDetail(req, env, +m[1]);
     }
-    if (m = p.match(/^\/api\/tickets\/(\d+)\/(claim|complete|close|release)$/)) {
+    if (m = p.match(/^\/api\/tickets\/(\d+)\/(claim|complete|close|release|request_complete|delete_all)$/)) {
       if (req.method==='POST') return handleTicketAction(req, env, +m[1], m[2]);
     }
     if (m = p.match(/^\/api\/tickets\/(\d+)\/messages$/)) {
       if (req.method==='GET') return handleGetMsgs(req, env, +m[1], url.searchParams.get('after'));
       if (req.method==='POST') return handleSendMsg(req, env, +m[1]);
+    }
+    if (m = p.match(/^\/api\/tickets\/(\d+)\/images$/)) {
+      if (req.method==='POST') return handleUploadImage(req, env, +m[1]);
+    }
+    if (m = p.match(/^\/api\/images\/(\d+)$/)) {
+      if (req.method==='GET') return handleGetImage(req, env, +m[1]);
     }
     if (m = p.match(/^\/api\/tickets\/(\d+)\/rating$/)) {
       if (req.method==='POST') return handleRateTicket(req, env, +m[1]);

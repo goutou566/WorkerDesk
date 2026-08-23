@@ -28,6 +28,11 @@ id = "dca9988baebb4664bdc52dff780420f2"
 binding = "CODES"
 id = "39adf220f1874e35bbab7051629a107c"
 
+# 聊天图片存储
+[[kv_namespaces]]
+binding = "IMAGES"
+id = "e341c3e96f91497e8476d95995979640"
+
 # 定时任务：每天凌晨0点清理前一天的订单
 [triggers]
 crons = ["0 0 * * *"]
