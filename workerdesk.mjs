@@ -403,10 +403,10 @@ async function api(m,p,b){const o={method:m,headers:{}};if(b){o.headers['Content
 function openModal(id){$('#'+id).classList.add('show');}
 function closeModal(id){$('#'+id).classList.remove('show');}
 window.closeModal=closeModal;
-function initNotify(){if('Notification' in window&&Notification.permission==='default')Notification.requestPermission();}
 let audioCtx=null;
 function playNotifSound(){if(localStorage.getItem('notifSound')==='off')return;if(!audioCtx)audioCtx=new(window.AudioContext||window.webkitAudioContext)();const o=audioCtx.createOscillator(),g=audioCtx.createGain();o.connect(g);g.connect(audioCtx.destination);o.frequency.value=800;o.type='sine';g.gain.setValueAtTime(0.3,audioCtx.currentTime);g.gain.exponentialRampToValueAtTime(0.01,audioCtx.currentTime+0.3);o.start(audioCtx.currentTime);o.stop(audioCtx.currentTime+0.3);}
-function notify(title,body){if('Notification' in window&&Notification.permission==='granted'){new Notification(title,{body,icon:'/favicon.ico'});playNotifSound();}}
+function notify(title,body){if(!('Notification' in window))return;if(Notification.permission==='granted'){new Notification(title,{body,icon:'/favicon.ico'});playNotifSound();}else if(Notification.permission!=='denied'){Notification.requestPermission().then(p=>{if(p==='granted'){new Notification(title,{body,icon:'/favicon.ico'});playNotifSound();}});}}
+function initNotifyBtn(btn){if(!btn)return;function updateBtn(){btn.textContent=localStorage.getItem('notifSound')==='off'?'🔇':'🔊';}updateBtn();btn.onclick=async()=>{if(!('Notification' in window)){toast('浏览器不支持通知','err');return;}if(Notification.permission==='default'){try{const p=await Notification.requestPermission();if(p==='granted'){toast('通知已开启','ok');}else{toast('通知权限被拒绝','err');}}catch(e){toast('无法请求通知权限','err');}}else if(Notification.permission==='denied'){toast('通知权限被拒绝，请在浏览器设置中开启','err');}else{localStorage.setItem('notifSound',localStorage.getItem('notifSound')==='off'?'':'off');updateBtn();}};}
 `;
 }
 
@@ -498,11 +498,7 @@ function renderUserPage(user){
 <script>
 ${commonJs()}
 const STATE = { user: ${user ? JSON.stringify({id:user.id,email:user.email,role:user.role}) : 'null'}, tickets: [], prevTickets: {}, chatId:null, lastMsgId:0, pollTimer:null };
-initNotify();
-const soundBtn=$('#soundToggle');
-function updateSoundBtn(){soundBtn.textContent=localStorage.getItem('notifSound')==='off'?'🔇':'🔊';}
-updateSoundBtn();
-soundBtn.onclick=()=>{localStorage.setItem('notifSound',localStorage.getItem('notifSound')==='off'?'':'off');updateSoundBtn();};
+initNotifyBtn($('#soundToggle'));
 
 $('#authForm')?.addEventListener('submit', async e=>{
   e.preventDefault();
@@ -723,11 +719,7 @@ function renderWorkerPage(user){
 <script>
 ${commonJs()}
 const STATE={ user:${user?JSON.stringify({id:user.id,email:user.email,role:user.role}):'null'}, mode:'login', view:'open', tickets:[], prevTicketCount:0, chatId:null, lastMsgId:0, poll:null };
-initNotify();
-const soundBtn=$('#soundToggle');
-function updateSoundBtn(){soundBtn.textContent=localStorage.getItem('notifSound')==='off'?'🔇':'🔊';}
-updateSoundBtn();
-soundBtn.onclick=()=>{localStorage.setItem('notifSound',localStorage.getItem('notifSound')==='off'?'':'off');updateSoundBtn();};
+initNotifyBtn($('#soundToggle'));
 
 $$('.tab').forEach(t=>t.onclick=()=>{
   if(t.dataset.view!==undefined){ STATE.view=t.dataset.view; $$('.tab').forEach(x=>x.classList.toggle('active',x===t)); renderList(); return; }
