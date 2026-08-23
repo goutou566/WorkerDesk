@@ -1,0 +1,36 @@
+name = "workerdesk"
+main = "workerdesk.mjs"
+compatibility_date = "2025-03-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Cloudflare 账户 ID
+account_id = "cbcec09aecf46fb093705f2080e078f7"
+
+# 环境变量
+[vars]
+ORIGIN = "https://kf.goutou.dpdns.org"
+SESSION_TTL = "2592000"  # 30 days
+CODE_TTL = "600"  # 10 minutes
+CACHE_TTL = "300"  # 5 minutes
+
+# D1 数据库绑定
+[[d1_databases]]
+binding = "DB"
+database_name = "workerdesk-db"
+database_id = "a7b61bd9-a710-442d-9068-8bd3a2f0209c"
+
+# KV 命名空间绑定
+[[kv_namespaces]]
+binding = "SESSIONS"
+id = "dca9988baebb4664bdc52dff780420f2"
+
+[[kv_namespaces]]
+binding = "CODES"
+id = "39adf220f1874e35bbab7051629a107c"
+
+# 环境变量（密钥）
+# 这些变量应该在 Cloudflare Dashboard 中设置为加密变量
+# [env.production.vars]
+# RESEND_API_KEY = "your-resend-api-key"
+# WORKER_CODE = "your-worker-code"
+# SERVICE_NAME = "WorkerDesk"
