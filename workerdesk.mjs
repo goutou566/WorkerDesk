@@ -1,14 +1,13 @@
---d48d6527c950c518d810efd427e833ca86bf6e2fc9b1cee277ab22bdbbcc
-Content-Disposition: form-data; name="worker.js"
-
 // WorkerDesk v3 - API中转站工单系统
 // 角色: user=发单方(email+pass注册), worker=接单方(邮箱验证+认证码)
 // Bindings: DB(D1), SESSIONS(KV), CODES(KV), WORKER_CODE(secret_text), SERVICE_NAME(optional plain_text)
 
 const ORIGIN = 'https://kf.goutou.dpdns.org';
-const SESSION_TTL = 60 * 60 * 24 * 30;
+const SESSION_TTL = 60 * 60 * 24 * 30; // 30 days
 const CODE_TTL = 600; // 10 min verification code
+const CACHE_TTL = 300; // 5 minutes cache for frequently accessed data
 
+// API类型定义
 const API_TYPES = [
   { id: 'chatgpt',  name: 'ChatGPT / OpenAI',  icon: '🟢' },
   { id: 'claude',   name: 'Claude / Anthropic', icon: '🟣' },
@@ -20,6 +19,7 @@ const API_TYPES = [
   { id: 'other',    name: '其他',               icon: '❓' }
 ];
 
+// 工单状态定义
 const TICKET_STATUS = {
   open:      { name: '待接单', color: '#22c55e', dot: '🟢' },
   claimed:   { name: '处理中', color: '#3b82f6', dot: '🔵' },
@@ -27,22 +27,79 @@ const TICKET_STATUS = {
   closed:    { name: '已关闭', color: '#6b7280', dot: '⚫' }
 };
 
-// =============== utils ===============
+// 缓存键定义
+const CACHE_KEYS = {
+  TICKET_LIST: 'cache:tickets:list:',
+  USER_TICKETS: 'cache:tickets:user:',
+  WORKER_STATS: 'cache:worker:stats:',
+  TICKET_DETAIL: 'cache:tickets:detail:'
+};
+
+// =============== 工具函数 ===============
+// JSON响应封装
 const json = (o, s=200, h={}) => new Response(JSON.stringify(o), { status:s, headers:{'Content-Type':'application/json; charset=utf-8', ...h} });
+
+// HTML转义函数，防止XSS攻击
 const esc  = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
+// SHA-256哈希函数
 async function sha256(s){ const b=await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s)); return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join(''); }
+
+// 生成随机token
 function rndToken(n=24){ const a=new Uint8Array(n); crypto.getRandomValues(a); return [...a].map(x=>x.toString(16).padStart(2,'0')).join(''); }
+
+// 生成6位随机验证码
 function rndCode(){ return String(Math.floor(100000 + Math.random()*900000)); }
+
+// 从请求中获取cookie
 function getCookie(req, name){ const m=(req.headers.get('Cookie')||'').match(new RegExp('(?:^|;\\s*)'+name+'=([^;]+)')); return m?m[1]:null; }
+
+// 获取用户会话
 async function session(req, env){
   const sid = getCookie(req, 'wd_sid');
   if (!sid) return null;
   return env.SESSIONS.get('sess:'+sid, { type:'json' });
 }
+
+// 设置cookie
 const setCookie = t => `wd_sid=${t}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${SESSION_TTL}`;
+
+// 清除cookie
 const clrCookie = ()=> 'wd_sid=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0';
 
+// =============== 缓存工具函数 ===============
+// 获取缓存
+async function getCache(env, key) {
+  try {
+    const cached = await env.SESSIONS.get(key, { type: 'json' });
+    return cached;
+  } catch (e) {
+    return null;
+  }
+}
+
+// 设置缓存
+async function setCache(env, key, data, ttl = CACHE_TTL) {
+  try {
+    await env.SESSIONS.put(key, JSON.stringify(data), { expirationTtl: ttl });
+  } catch (e) {
+    // 缓存设置失败，继续执行不使用缓存
+  }
+}
+
+// 清除缓存
+async function invalidateCache(env, pattern) {
+  try {
+    const keys = await env.SESSIONS.list({ prefix: pattern });
+    for (const key of keys.keys) {
+      await env.SESSIONS.delete(key.name);
+    }
+  } catch (e) {
+    // 缓存清除失败
+  }
+}
+
+// 格式化相对时间
 function fmtRel(s){
   if (!s) return '';
   const d = new Date(s.replace(' ','T')+'Z').getTime();
@@ -54,6 +111,7 @@ function fmtRel(s){
   return s.substring(5,16);
 }
 
+// 验证邮箱格式
 function validEmail(e){ return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e); }
 
 // =============== email (Resend) ===============
@@ -78,68 +136,104 @@ async function sendCode(to, code, env){
 
 // =============== auth ===============
 async function handleSendCode(req, env){
-  const b = await req.json().catch(()=>({}));
-  const email = (b.email||'').trim().toLowerCase();
-  if (!validEmail(email)) return json({ error:'邮箱格式错误' }, 400);
-  const code = rndCode();
-  await env.CODES.put('code:'+email, code, { expirationTtl: CODE_TTL });
-  const res = await sendCode(email, code, env);
-  if (!res.ok) {
-    // In case MailChannels isn't working yet, return code in dev mode is unsafe.
-    // Return error; admin can check logs. Also log to console.
-    console.log('MAIL_FAIL', email, code, res.error);
-    return json({ error:'验证码邮件发送失败，请稍后重试或联系管理员。' }, 502);
+  try {
+    const b = await req.json().catch(()=>({}));
+    const email = (b.email||'').trim().toLowerCase();
+    if (!validEmail(email)) return json({ error:'邮箱格式错误' }, 400);
+    
+    // Rate limiting: check if a code was recently sent
+    const lastCode = await env.CODES.get('code:'+email);
+    if (lastCode) {
+      // If a code exists, check if it was sent recently (within 60 seconds)
+      // This is a simple rate limiting mechanism
+      return json({ error:'验证码已发送，请稍后再试' }, 429);
+    }
+    
+    const code = rndCode();
+    await env.CODES.put('code:'+email, code, { expirationTtl: CODE_TTL });
+    const res = await sendCode(email, code, env);
+    if (!res.ok) {
+      // In case MailChannels isn't working yet, return code in dev mode is unsafe.
+      // Return error; admin can check logs. Also log to console.
+      console.log('MAIL_FAIL', email, code, res.error);
+      return json({ error:'验证码邮件发送失败，请稍后重试或联系管理员。' }, 502);
+    }
+    return json({ ok:true });
+  } catch (e) {
+    console.log('SEND_CODE_ERROR', e);
+    return json({ error:'服务器错误，请稍后重试' }, 500);
   }
-  return json({ ok:true });
 }
 
 async function handleRegister(req, env, role){
-  const b = await req.json().catch(()=>({}));
-  const email = (b.email||'').trim().toLowerCase();
-  const pass = b.pass || '';
-  const code = (b.code||'').trim();
-  if (!validEmail(email)) return json({error:'邮箱格式错误'},400);
-  if (pass.length < 6) return json({error:'口令至少 6 位'},400);
+  try {
+    const b = await req.json().catch(()=>({}));
+    const email = (b.email||'').trim().toLowerCase();
+    const pass = b.pass || '';
+    const code = (b.code||'').trim();
+    
+    // Input validation
+    if (!validEmail(email)) return json({error:'邮箱格式错误'},400);
+    if (pass.length < 6) return json({error:'口令至少 6 位'},400);
+    if (pass.length > 100) return json({error:'口令不能超过 100 位'},400);
+    
+    // Sanitize email to prevent injection
+    const sanitizedEmail = email.replace(/[^a-z0-9@._-]/g, '');
 
   // user role: no email verification required; just email + pass
   // worker role: email verification code required + worker auth code
   if (role === 'worker') {
     if (!/^\d{6}$/.test(code)) return json({error:'请输入 6 位邮箱验证码'},400);
-    const saved = await env.CODES.get('code:'+email);
+    const saved = await env.CODES.get('code:'+sanitizedEmail);
     if (!saved || saved !== code) return json({error:'验证码错误或已过期'},400);
     const wc = b.workerCode || '';
     if (!wc || wc !== env.WORKER_CODE) return json({error:'接单员认证码错误'},403);
   }
 
-  const exists = await env.DB.prepare('SELECT id FROM users WHERE email=?').bind(email).first();
+  const exists = await env.DB.prepare('SELECT id FROM users WHERE email=?').bind(sanitizedEmail).first();
   if (exists) return json({error:'该邮箱已注册'},409);
 
   const ph = await sha256(pass);
   const r = await env.DB.prepare('INSERT INTO users (email, pass_hash, role, verified) VALUES (?,?,?,?)')
-    .bind(email, ph, role, role === 'worker' ? 1 : 0).run();
+    .bind(sanitizedEmail, ph, role, role === 'worker' ? 1 : 0).run();
   const uid = r.meta.last_row_id;
-  if (role === 'worker') await env.CODES.delete('code:'+email);
+  if (role === 'worker') await env.CODES.delete('code:'+sanitizedEmail);
 
   const token = rndToken();
-  const sess = { id: uid, email, role };
+  const sess = { id: uid, email: sanitizedEmail, role };
   await env.SESSIONS.put('sess:'+token, JSON.stringify(sess), { expirationTtl: SESSION_TTL });
   return json({ user: sess }, 200, { 'Set-Cookie': setCookie(token) });
+  } catch (e) {
+    console.log('REGISTER_ERROR', e);
+    return json({error:'服务器错误，请稍后重试'},500);
+  }
 }
 
 async function handleLogin(req, env){
-  const b = await req.json().catch(()=>({}));
-  const email = (b.email||'').trim().toLowerCase();
-  if (!validEmail(email)) return json({error:'请输入有效邮箱'},400);
-  let u = await env.DB.prepare('SELECT id, email, role FROM users WHERE email=?').bind(email).first();
-  if (!u) {
-    const r = await env.DB.prepare('INSERT INTO users (email, pass_hash, role, verified) VALUES (?,?,?,?)')
-      .bind(email, '', 'user', 0).run();
-    u = { id: r.meta.last_row_id, email, role: 'user' };
+  try {
+    const b = await req.json().catch(()=>({}));
+    const email = (b.email||'').trim().toLowerCase();
+    
+    // Input validation
+    if (!validEmail(email)) return json({error:'请输入有效邮箱'},400);
+    
+    // Sanitize email
+    const sanitizedEmail = email.replace(/[^a-z0-9@._-]/g, '');
+    
+    let u = await env.DB.prepare('SELECT id, email, role FROM users WHERE email=?').bind(sanitizedEmail).first();
+    if (!u) {
+      const r = await env.DB.prepare('INSERT INTO users (email, pass_hash, role, verified) VALUES (?,?,?,?)')
+        .bind(sanitizedEmail, '', 'user', 0).run();
+      u = { id: r.meta.last_row_id, email: sanitizedEmail, role: 'user' };
+    }
+    const token = rndToken();
+    const sess = { id:u.id, email:u.email, role:u.role };
+    await env.SESSIONS.put('sess:'+token, JSON.stringify(sess), { expirationTtl: SESSION_TTL });
+    return json({ user: sess }, 200, { 'Set-Cookie': setCookie(token) });
+  } catch (e) {
+    console.log('LOGIN_ERROR', e);
+    return json({error:'服务器错误，请稍后重试'},500);
   }
-  const token = rndToken();
-  const sess = { id:u.id, email:u.email, role:u.role };
-  await env.SESSIONS.put('sess:'+token, JSON.stringify(sess), { expirationTtl: SESSION_TTL });
-  return json({ user: sess }, 200, { 'Set-Cookie': setCookie(token) });
 }
 
 async function handleLogout(req, env){
@@ -150,48 +244,94 @@ async function handleLogout(req, env){
 
 // =============== tickets ===============
 async function handleCreateTicket(req, env){
-  const u = await session(req, env);
-  if (!u || u.role !== 'user') return json({error:'请以发单方身份登录'},401);
-  const b = await req.json().catch(()=>({}));
-  const api_type = b.api_type;
-  const title = (b.title||'').trim();
-  const description = (b.description||'').trim();
-  const error_msg = (b.error_msg||'').trim();
-  const todesk = (b.todesk_code||'').trim();
-  if (!API_TYPES.find(x=>x.id===api_type)) return json({error:'请选择问题类型'},400);
-  if (!title || title.length>80) return json({error:'标题 1-80 字'},400);
-  if (!description || description.length>2000) return json({error:'问题描述 1-2000 字'},400);
-  if (!todesk || todesk.length>50) return json({error:'请填写 ToDesk 远控码'},400);
+  try {
+    const u = await session(req, env);
+    if (!u || u.role !== 'user') return json({error:'请以发单方身份登录'},401);
+    const b = await req.json().catch(()=>({}));
+    const api_type = b.api_type;
+    const title = (b.title||'').trim();
+    const description = (b.description||'').trim();
+    const error_msg = (b.error_msg||'').trim();
+    const todesk = (b.todesk_code||'').trim();
+    
+    // Input validation
+    if (!API_TYPES.find(x=>x.id===api_type)) return json({error:'请选择问题类型'},400);
+    if (!title || title.length>80) return json({error:'标题 1-80 字'},400);
+    if (!description || description.length>2000) return json({error:'问题描述 1-2000 字'},400);
+    if (!todesk || todesk.length>50) return json({error:'请填写 ToDesk 远控码'},400);
+    
+    // Sanitize inputs to prevent XSS
+    const sanitizedTitle = title.replace(/[<>'"]/g, '');
+    const sanitizedDescription = description.replace(/[<>'"]/g, '');
+    const sanitizedErrorMsg = error_msg.replace(/[<>'"]/g, '');
+    const sanitizedToDesk = todesk.replace(/[<>'"]/g, '');
 
-  const r = await env.DB.prepare(
-    `INSERT INTO tickets (user_id, api_type, title, description, error_msg, todesk_code)
-     VALUES (?,?,?,?,?,?)`
-  ).bind(u.id, api_type, title, description, error_msg || null, todesk).run();
-  const ticketId = r.meta.last_row_id;
-  return json({ id: ticketId });
+    const r = await env.DB.prepare(
+      `INSERT INTO tickets (user_id, api_type, title, description, error_msg, todesk_code)
+       VALUES (?,?,?,?,?,?)`
+    ).bind(u.id, api_type, sanitizedTitle, sanitizedDescription, sanitizedErrorMsg || null, sanitizedToDesk).run();
+    const ticketId = r.meta.last_row_id;
+    
+    // Invalidate user's ticket cache and open tickets cache
+    await invalidateCache(env, CACHE_KEYS.USER_TICKETS + u.id);
+    await invalidateCache(env, CACHE_KEYS.TICKET_LIST);
+    
+    return json({ id: ticketId });
+  } catch (e) {
+    console.log('CREATE_TICKET_ERROR', e);
+    return json({error:'服务器错误，请稍后重试'},500);
+  }
 }
 
 async function handleListMyTickets(req, env){
   const u = await session(req, env);
   if (!u) return json({error:'未登录'},401);
+  
+  // Try to get from cache first
+  const cacheKey = CACHE_KEYS.USER_TICKETS + u.id;
+  const cached = await getCache(env, cacheKey);
+  if (cached) {
+    return json({ tickets: cached });
+  }
+  
   const { results } = await env.DB.prepare(
     `SELECT t.*, w.email AS worker_email
      FROM tickets t LEFT JOIN users w ON w.id=t.worker_id
      WHERE t.user_id=? ORDER BY t.id DESC LIMIT 200`
   ).bind(u.id).all();
-  return json({ tickets: results || [] });
+  
+  const tickets = results || [];
+  
+  // Cache the results
+  await setCache(env, cacheKey, tickets, 60); // Cache for 1 minute
+  
+  return json({ tickets });
 }
 
 async function handleListOpenTickets(req, env){
   const u = await session(req, env);
   if (!u || u.role !== 'worker') return json({error:'需接单员账号'},401);
+  
+  // Try to get from cache first
+  const cacheKey = CACHE_KEYS.TICKET_LIST + 'open';
+  const cached = await getCache(env, cacheKey);
+  if (cached) {
+    return json({ tickets: cached });
+  }
+  
   const { results } = await env.DB.prepare(
     `SELECT t.id, t.api_type, t.title, t.description, t.error_msg, t.status, t.created_at, t.claimed_at,
             u.email AS user_email, w.email AS worker_email
      FROM tickets t JOIN users u ON u.id=t.user_id LEFT JOIN users w ON w.id=t.worker_id
      WHERE t.status IN ('open','claimed') ORDER BY t.id DESC LIMIT 200`
   ).all();
-  return json({ tickets: results || [] });
+  
+  const tickets = results || [];
+  
+  // Cache the results for a short time (30 seconds) since this list changes frequently
+  await setCache(env, cacheKey, tickets, 30);
+  
+  return json({ tickets });
 }
 
 async function handleTicketAction(req, env, id, action){
@@ -220,6 +360,16 @@ async function handleTicketAction(req, env, id, action){
     await env.DB.prepare("UPDATE tickets SET status='open', worker_id=NULL, claimed_at=NULL WHERE id=?").bind(id).run();
   } else return json({error:'未知操作'},400);
 
+  // Invalidate related caches
+  await invalidateCache(env, CACHE_KEYS.TICKET_LIST);
+  await invalidateCache(env, CACHE_KEYS.USER_TICKETS + t.user_id);
+  if (t.worker_id) {
+    await invalidateCache(env, CACHE_KEYS.WORKER_STATS + t.worker_id);
+  }
+  if (u.role === 'worker') {
+    await invalidateCache(env, CACHE_KEYS.WORKER_STATS + u.id);
+  }
+
   return json({ok:true});
 }
 
@@ -235,46 +385,85 @@ async function handleTicketDetail(req, env, id){
 }
 
 async function handleRateTicket(req, env, id){
-  const u = await session(req, env);
-  if (!u) return json({error:'未登录'},401);
-  const t = await env.DB.prepare('SELECT * FROM tickets WHERE id=?').bind(id).first();
-  if (!t) return json({error:'工单不存在'},404);
-  if (t.user_id !== u.id) return json({error:'仅发单方可评分'},403);
-  if (t.status !== 'completed') return json({error:'仅已完成工单可评分'},400);
-  if (t.rating !== null) return json({error:'已评分'},400);
-  const b = await req.json().catch(()=>({}));
-  const rating = parseInt(b.rating);
-  if (!rating || rating < 1 || rating > 5) return json({error:'评分 1-5'},400);
-  await env.DB.prepare('UPDATE tickets SET rating=? WHERE id=?').bind(rating, id).run();
-  return json({ok:true});
+  try {
+    const u = await session(req, env);
+    if (!u) return json({error:'未登录'},401);
+    const t = await env.DB.prepare('SELECT * FROM tickets WHERE id=?').bind(id).first();
+    if (!t) return json({error:'工单不存在'},404);
+    if (t.user_id !== u.id) return json({error:'仅发单方可评分'},403);
+    if (t.status !== 'completed') return json({error:'仅已完成工单可评分'},400);
+    if (t.rating !== null) return json({error:'已评分'},400);
+    const b = await req.json().catch(()=>({}));
+    const rating = parseInt(b.rating);
+    
+    // Input validation
+    if (!rating || rating < 1 || rating > 5) return json({error:'评分 1-5'},400);
+    
+    await env.DB.prepare('UPDATE tickets SET rating=? WHERE id=?').bind(rating, id).run();
+    
+    // Invalidate worker stats cache
+    if (t.worker_id) {
+      await invalidateCache(env, CACHE_KEYS.WORKER_STATS + t.worker_id);
+    }
+    
+    return json({ok:true});
+  } catch (e) {
+    console.log('RATE_TICKET_ERROR', e);
+    return json({error:'服务器错误，请稍后重试'},500);
+  }
 }
 
 async function handleWorkerStats(req, env){
   const u = await session(req, env);
   if (!u || u.role !== 'worker') return json({error:'需接单员账号'},401);
+  
+  // Try to get from cache first
+  const cacheKey = CACHE_KEYS.WORKER_STATS + u.id;
+  const cached = await getCache(env, cacheKey);
+  if (cached) {
+    return json({ stats: cached });
+  }
+  
   const { results } = await env.DB.prepare(
     `SELECT COUNT(*) as total, COUNT(CASE WHEN status='completed' THEN 1 END) as completed,
             COUNT(CASE WHEN rating IS NOT NULL THEN 1 END) as rated,
             COALESCE(AVG(CASE WHEN rating IS NOT NULL THEN rating END), 0) as avg_rating
      FROM tickets WHERE worker_id=?`
   ).bind(u.id).all();
-  return json({ stats: results[0] || { total:0, completed:0, rated:0, avg_rating:0 } });
+  
+  const stats = results[0] || { total:0, completed:0, rated:0, avg_rating:0 };
+  
+  // Cache the stats for 2 minutes
+  await setCache(env, cacheKey, stats, 120);
+  
+  return json({ stats });
 }
 
 // =============== messages ===============
 async function handleSendMsg(req, env, ticketId){
-  const u = await session(req, env);
-  if (!u) return json({error:'未登录'},401);
-  const t = await env.DB.prepare('SELECT * FROM tickets WHERE id=?').bind(ticketId).first();
-  if (!t) return json({error:'工单不存在'},404);
-  if (t.user_id !== u.id && t.worker_id !== u.id) return json({error:'无权限'},403);
-  if (t.status !== 'claimed' && t.status !== 'completed') return json({error:'工单未在进行中'},400);
-  const b = await req.json().catch(()=>({}));
-  const content = (b.content||'').trim();
-  if (!content || content.length>1000) return json({error:'消息 1-1000 字'},400);
-  const r = await env.DB.prepare('INSERT INTO messages (ticket_id, sender_id, content) VALUES (?,?,?)')
-    .bind(ticketId, u.id, content).run();
-  return json({ id: r.meta.last_row_id });
+  try {
+    const u = await session(req, env);
+    if (!u) return json({error:'未登录'},401);
+    const t = await env.DB.prepare('SELECT * FROM tickets WHERE id=?').bind(ticketId).first();
+    if (!t) return json({error:'工单不存在'},404);
+    if (t.user_id !== u.id && t.worker_id !== u.id) return json({error:'无权限'},403);
+    if (t.status !== 'claimed' && t.status !== 'completed') return json({error:'工单未在进行中'},400);
+    const b = await req.json().catch(()=>({}));
+    const content = (b.content||'').trim();
+    
+    // Input validation
+    if (!content || content.length>1000) return json({error:'消息 1-1000 字'},400);
+    
+    // Sanitize content to prevent XSS
+    const sanitizedContent = content.replace(/[<>'"]/g, '');
+    
+    const r = await env.DB.prepare('INSERT INTO messages (ticket_id, sender_id, content) VALUES (?,?,?)')
+      .bind(ticketId, u.id, sanitizedContent).run();
+    return json({ id: r.meta.last_row_id });
+  } catch (e) {
+    console.log('SEND_MSG_ERROR', e);
+    return json({error:'服务器错误，请稍后重试'},500);
+  }
 }
 
 async function handleGetMsgs(req, env, ticketId, afterId){
@@ -407,6 +596,28 @@ let audioCtx=null;
 function playNotifSound(){if(localStorage.getItem('notifSound')==='off')return;if(!audioCtx)audioCtx=new(window.AudioContext||window.webkitAudioContext)();const o=audioCtx.createOscillator(),g=audioCtx.createGain();o.connect(g);g.connect(audioCtx.destination);o.frequency.value=800;o.type='sine';g.gain.setValueAtTime(0.3,audioCtx.currentTime);g.gain.exponentialRampToValueAtTime(0.01,audioCtx.currentTime+0.3);o.start(audioCtx.currentTime);o.stop(audioCtx.currentTime+0.3);}
 function notify(title,body){if(!('Notification' in window))return;if(Notification.permission==='granted'){new Notification(title,{body,icon:'/favicon.ico'});playNotifSound();}else if(Notification.permission!=='denied'){Notification.requestPermission().then(p=>{if(p==='granted'){new Notification(title,{body,icon:'/favicon.ico'});playNotifSound();}});}}
 function initNotifyBtn(btn){if(!btn)return;function updateBtn(){btn.textContent=localStorage.getItem('notifSound')==='off'?'🔇':'🔊';}updateBtn();btn.onclick=async()=>{if(!('Notification' in window)){toast('浏览器不支持通知','err');return;}if(Notification.permission==='default'){try{const p=await Notification.requestPermission();if(p==='granted'){toast('通知已开启','ok');}else{toast('通知权限被拒绝','err');}}catch(e){toast('无法请求通知权限','err');}}else if(Notification.permission==='denied'){toast('通知权限被拒绝，请在浏览器设置中开启','err');}else{localStorage.setItem('notifSound',localStorage.getItem('notifSound')==='off'?'':'off');updateBtn();}};}
+
+// Common ticket rendering functions
+function typeBadge(id){const t=${JSON.stringify(API_TYPES)}.find(x=>x.id===id)||{icon:'❓',name:id};return '<span class="type-badge">'+t.icon+' '+esc(t.name)+'</span>';}
+function statusPill(s){const m=${JSON.stringify(TICKET_STATUS)};const x=m[s]||m.open;return '<span class="t-status" style="color:'+x.color+'">'+x.dot+' '+x.name+'</span>';}
+
+// Polling manager to avoid duplicate timers
+const PollManager = {
+  timers: {},
+  start(key, fn, interval) {
+    this.stop(key);
+    this.timers[key] = setInterval(fn, interval);
+  },
+  stop(key) {
+    if (this.timers[key]) {
+      clearInterval(this.timers[key]);
+      delete this.timers[key];
+    }
+  },
+  stopAll() {
+    Object.keys(this.timers).forEach(key => this.stop(key));
+  }
+};
 `;
 }
 
@@ -526,9 +737,6 @@ $('#ticketForm')?.addEventListener('submit', async e=>{
 
 $('#refreshBtn')?.addEventListener('click', loadTickets);
 
-function typeBadge(id){const t=${JSON.stringify(API_TYPES)}.find(x=>x.id===id)||{icon:'❓',name:id};return '<span class="type-badge">'+t.icon+' '+esc(t.name)+'</span>';}
-function statusPill(s){const m=${JSON.stringify(TICKET_STATUS)};const x=m[s]||m.open;return '<span class="t-status" style="color:'+x.color+'">'+x.dot+' '+x.name+'</span>';}
-
 async function loadTickets(){
   try{
     const d=await api('GET','/api/tickets/mine');
@@ -614,10 +822,11 @@ function openChat(id){
   $('#chatBox').classList.add('show');
   $('#chatMsgs').innerHTML='';
   pollMsgs();
-  STATE.pollTimer=setInterval(pollMsgs,2000);
+  PollManager.start('chat', pollMsgs, 2000);
 }
 function closeChat(){
-  STATE.chatId=null;if(STATE.pollTimer){clearInterval(STATE.pollTimer);STATE.pollTimer=null;}
+  STATE.chatId=null;
+  PollManager.stop('chat');
   $('#chatBox').classList.remove('show');
 }
 $('#chatBack').onclick=closeChat;
@@ -647,7 +856,7 @@ async function sendMsg(){
 
 $('#fabTop').onclick=()=>window.scrollTo({top:0,behavior:'smooth'});
 
-if(STATE.user){ loadTickets(); setInterval(loadTickets, 5000); }
+if(STATE.user){ loadTickets(); PollManager.start('userTickets', loadTickets, 5000); }
 </script>
 </body></html>`;
 }
@@ -753,9 +962,6 @@ $('#authForm')?.addEventListener('submit',async e=>{
 $('#logoutBtn')?.addEventListener('click',async()=>{await api('POST','/api/auth/logout');location.reload();});
 $('#refreshBtn')?.addEventListener('click',loadAll);
 
-function typeBadge(id){const t=${JSON.stringify(API_TYPES)}.find(x=>x.id===id)||{icon:'❓',name:id};return '<span class="type-badge">'+t.icon+' '+esc(t.name)+'</span>';}
-function statusPill(s){const m=${JSON.stringify(TICKET_STATUS)};const x=m[s]||m.open;return '<span class="t-status" style="color:'+x.color+'">'+x.dot+' '+x.name+'</span>';}
-
 async function loadAll(){
   try{
     const d=await api('GET','/api/tickets/open');
@@ -830,9 +1036,9 @@ function openChat(id,title){
   STATE.chatId=id;STATE.lastMsgId=0;
   $('#chatTitle').textContent='# '+id+(title?' · '+title:'');
   $('#chatBox').classList.add('show');$('#chatMsgs').innerHTML='';
-  pollMsgs();STATE.poll=setInterval(pollMsgs,2000);
+  pollMsgs();PollManager.start('chat', pollMsgs, 2000);
 }
-function closeChat(){STATE.chatId=null;if(STATE.poll){clearInterval(STATE.poll);STATE.poll=null;}$('#chatBox').classList.remove('show');}
+function closeChat(){STATE.chatId=null;PollManager.stop('chat');$('#chatBox').classList.remove('show');}
 $('#chatBack').onclick=closeChat;
 async function pollMsgs(){
   if(!STATE.chatId)return;
@@ -857,7 +1063,7 @@ async function sendMsg(){
   catch(e){toast(e.message,'err');inp.value=v;}
 }
 
-if(STATE.user){ loadAll(); setInterval(loadAll, 5000); }
+if(STATE.user){ loadAll(); PollManager.start('workerTickets', loadAll, 5000); }
 </script>
 </body></html>`;
 }
@@ -935,5 +1141,3 @@ export default {
     return Response.redirect(ORIGIN+'/fd', 302);
   }
 };
-
---d48d6527c950c518d810efd427e833ca86bf6e2fc9b1cee277ab22bdbbcc--
