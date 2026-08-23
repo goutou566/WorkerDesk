@@ -342,9 +342,8 @@ async function handleTicketAction(req, env, id, action){
   if (!t) return json({error:'工单不存在'},404);
 
   if (action === 'claim') {
-    // 发单方和接单员都可以接单
+    // 发单方和接单员都可以接单（发单方接自己的单=自己处理）
     if (t.status !== 'open') return json({error:'该工单已被接走或关闭'},400);
-    if (t.user_id === u.id) return json({error:'不能接自己的单'},400);
     await env.DB.prepare("UPDATE tickets SET status='claimed', worker_id=?, claimed_at=datetime('now') WHERE id=? AND status='open'")
       .bind(u.id, id).run();
   } else if (action === 'request_complete') {
