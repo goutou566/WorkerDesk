@@ -595,25 +595,25 @@ window.closeModal=closeModal;
 let audioCtx=null;
 function playNotifSound(){
   if(localStorage.getItem('notifSound')==='off')return;
-  if(!audioCtx)audioCtx=new(window.AudioContext||window.webkitAudioContext)();
-  
-  // 播放3声提醒，音量更大
-  const notes = [880, 1100, 880]; // 3个音调
-  const noteLength = 0.15; // 每个音符时长
-  
-  notes.forEach((freq, i) => {
-    const o = audioCtx.createOscillator();
-    const g = audioCtx.createGain();
-    o.connect(g);
-    g.connect(audioCtx.destination);
-    o.frequency.value = freq;
-    o.type = 'sine';
-    const startTime = audioCtx.currentTime + i * noteLength;
-    g.gain.setValueAtTime(0.6, startTime);
-    g.gain.exponentialRampToValueAtTime(0.01, startTime + noteLength);
-    o.start(startTime);
-    o.stop(startTime + noteLength);
-  });
+  try{
+    if(!audioCtx)audioCtx=new(window.AudioContext||window.webkitAudioContext)();
+    if(audioCtx.state==='suspended')audioCtx.resume();
+    
+    // 播放3声提醒
+    const playNote=(freq,delay)=>{
+      const o=audioCtx.createOscillator();
+      const g=audioCtx.createGain();
+      o.connect(g);g.connect(audioCtx.destination);
+      o.frequency.value=freq;o.type='sine';
+      const t=audioCtx.currentTime+delay;
+      g.gain.setValueAtTime(0.6,t);
+      g.gain.exponentialRampToValueAtTime(0.01,t+0.15);
+      o.start(t);o.stop(t+0.15);
+    };
+    playNote(880,0);
+    playNote(1100,0.15);
+    playNote(880,0.3);
+  }catch(e){}
 }
 function notify(title,body){if(!('Notification' in window))return;if(Notification.permission==='granted'){new Notification(title,{body,icon:'/favicon.ico'});playNotifSound();}else if(Notification.permission!=='denied'){Notification.requestPermission().then(p=>{if(p==='granted'){new Notification(title,{body,icon:'/favicon.ico'});playNotifSound();}});}}
 function initNotifyBtn(btn){if(!btn)return;function updateBtn(){btn.textContent=localStorage.getItem('notifSound')==='off'?'🔇':'🔊';}updateBtn();btn.onclick=async()=>{if(!('Notification' in window)){toast('浏览器不支持通知','err');return;}if(Notification.permission==='default'){try{const p=await Notification.requestPermission();if(p==='granted'){toast('通知已开启','ok');}else{toast('通知权限被拒绝','err');}}catch(e){toast('无法请求通知权限','err');}}else if(Notification.permission==='denied'){toast('通知权限被拒绝，请在浏览器设置中开启','err');}else{localStorage.setItem('notifSound',localStorage.getItem('notifSound')==='off'?'':'off');updateBtn();}};}
